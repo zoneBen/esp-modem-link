@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,7 @@ class MockHal : public IModuleHal {
     last_host = std::string(host);
     last_port = port;
     last_ssl = ssl;
+    last_connect_id = next_connect_id;
     tcp_connect_calls++;
     if (fail_tcp_connect) {
       return std::unexpected(
@@ -99,24 +101,23 @@ class MockHal : public IModuleHal {
   bool fail_tcp_connect = false;
   bool fail_tcp_send = false;
 
-  // Drive the callbacks the client installed, the way the AT layer does when a
-  // +MIPURC / +MIPCLOSE URC arrives. Without this the client's unsolicited data
-  // path is untestable, which is how it once shipped complete but unconnected.
+  // Lets a test hand the next connection a cid an earlier one used, which is what
+  // the pool does once a socket is released.
+  void SetNextConnectId(int id) { next_connect_id = id; }
+
+  // Drive the URC path the way the AT layer does when a +MIPURC / +MIPCLOSE line
+  // arrives. The HAL does the routing, so these call the same helpers Ml307Hal
+  // calls; going around them would test a path the hardware never takes.
   void EmitTcpData(int connect_id, std::string_view data) {
-    if (on_tcp_data_) on_tcp_data_(connect_id, data);
+    DispatchTcpData(connect_id, data);
   }
-  void EmitTcpClose(int connect_id) {
-    if (on_tcp_close_) on_tcp_close_(connect_id);
-  }
-  bool HasTcpCallbacks() const {
-    return static_cast<bool>(on_tcp_data_) &&
-           static_cast<bool>(on_tcp_close_);
-  }
+  void EmitTcpClose(int connect_id) { DispatchTcpClose(connect_id); }
 
   // Last call records
   std::string last_host;
   uint16_t last_port = 0;
   bool last_ssl = false;
+  int last_connect_id = -1;
   int last_close_id = -1;
   int last_send_id = -1;
   std::string last_send_data;
@@ -240,16 +241,8 @@ TEST(HalTcpClientTest, GetSendBufferFreeReturnsMax) {
 }
 
 // Everything below exercises the unsolicited half of the client. A payload that
-// the HAL decodes but the client never subscribes to is silently dropped, so
-// these assert delivery end to end rather than that a setter did not crash.
-
-TEST(HalTcpClientTest, ConnectRegistersCallbacksWithHal) {
-  MockHal hal;
-  HalTcpClient client(hal);
-
-  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
-  EXPECT_TRUE(hal.HasTcpCallbacks());
-}
+// the HAL decodes but no route was registered for is silently dropped, so these
+// assert delivery end to end rather than that a subscription call did not crash.
 
 TEST(HalTcpClientTest, InboundDataReachesOnData) {
   MockHal hal;
@@ -272,7 +265,8 @@ TEST(HalTcpClientTest, InboundDataForAnotherConnectionIsIgnored) {
   client.OnData([&](std::string_view) { called = true; });
   ASSERT_TRUE(client.Connect("example.com", 80).has_value());
 
-  // The HAL reports every socket; a payload for someone else's is not ours.
+  // The cid is the only thing the module names, so the route is what keeps one
+  // client's traffic away from another's.
   hal.EmitTcpData(1, "not ours");
 
   EXPECT_FALSE(called);
@@ -323,15 +317,122 @@ TEST(HalTcpClientTest, DisconnectNotifiesOnDisconnectedOnce) {
   EXPECT_EQ(count, 1);
 }
 
-TEST(HalTcpClientTest, DestructorUnregistersCallbacks) {
+// Two clients on one HAL. With a single slot for inbound events the second
+// Connect took the routes away from the first, leaving it connected and deaf -
+// which is why routing is per connection rather than per HAL.
+TEST(HalTcpClientTest, TwoClientsEachReceiveTheirOwnTraffic) {
   MockHal hal;
+  HalTcpClient first(hal);
+  HalTcpClient second(hal);
+
+  std::string first_got;
+  std::string second_got;
+  first.OnData([&](std::string_view data) { first_got = std::string(data); });
+  second.OnData([&](std::string_view data) { second_got = std::string(data); });
+  ASSERT_TRUE(first.Connect("a.example", 80).has_value());
+  ASSERT_TRUE(second.Connect("b.example", 80).has_value());
+
+  hal.EmitTcpData(1, "for the second");
+  hal.EmitTcpData(0, "for the first");
+
+  EXPECT_EQ(first_got, "for the first");
+  EXPECT_EQ(second_got, "for the second");
+}
+
+TEST(HalTcpClientTest, CloseOnOneConnectionLeavesTheOtherConnected) {
+  MockHal hal;
+  HalTcpClient first(hal);
+  HalTcpClient second(hal);
+
+  bool first_closed = false;
+  bool second_closed = false;
+  first.OnDisconnected([&] { first_closed = true; });
+  second.OnDisconnected([&] { second_closed = true; });
+  ASSERT_TRUE(first.Connect("a.example", 80).has_value());
+  ASSERT_TRUE(second.Connect("b.example", 80).has_value());
+
+  hal.EmitTcpClose(0);
+
+  EXPECT_TRUE(first_closed);
+  EXPECT_FALSE(second_closed);
+  EXPECT_FALSE(first.IsConnected());
+  EXPECT_TRUE(second.IsConnected());
+}
+
+// A route is looked up under a lock, but the handler is called after it is
+// released: opening or closing a connection from inside a data callback is
+// something a client legitimately does, and it takes that same lock. A dispatch
+// that called under the lock would self-deadlock, which MSVC's mutex reports as a
+// failure rather than blocking on.
+TEST(HalTcpClientTest, ADataHandlerMayOpenAnotherConnection) {
+  MockHal hal;
+  HalTcpClient first(hal);
+  HalTcpClient second(hal);
+
+  bool opened_from_callback = false;
+  first.OnData([&](std::string_view) {
+    opened_from_callback = second.Connect("b.example", 80).has_value();
+  });
+  ASSERT_TRUE(first.Connect("a.example", 80).has_value());
+
+  hal.EmitTcpData(0, "hello");
+
+  EXPECT_TRUE(opened_from_callback);
+}
+
+// Why a subscription is named by a handle rather than by its cid: a cid goes back
+// into the pool the moment the module closes the socket, and the client that used
+// to hold it is still around. Withdrawing is scoped to the handle, so the client
+// that left cannot take the route belonging to whoever holds the cid now.
+TEST(HalTcpClientTest, WithdrawingLeavesAnotherRouteOnTheSameCidAlone) {
+  MockHal hal;
+  auto leaving = std::make_unique<HalTcpClient>(hal);
+  ASSERT_TRUE(leaving->Connect("a.example", 80).has_value());
+
+  // The peer closes, so the client learns and the cid goes back into the pool -
+  // without the client itself having been destroyed yet.
+  hal.EmitTcpClose(0);
+  ASSERT_FALSE(leaving->IsConnected());
+
+  hal.SetNextConnectId(0);
+  HalTcpClient replacement(hal);
+  std::string received;
+  replacement.OnData(
+      [&](std::string_view data) { received = std::string(data); });
+  ASSERT_TRUE(replacement.Connect("b.example", 80).has_value());
+  ASSERT_EQ(hal.last_connect_id, 0);
+
+  leaving.reset();
+
+  hal.EmitTcpData(0, "for the replacement");
+
+  EXPECT_EQ(received, "for the replacement");
+}
+
+// What withdrawal is for: the HAL outlives its clients, so a route that survives
+// its client is a call into freed memory rather than a leak. Either of the two
+// paths out of the destructor would clear this on its own; removing both is what
+// this catches.
+TEST(HalTcpClientTest, ADestroyedClientStopsReceiving) {
+  MockHal hal;
+  int observed = 0;
   {
-    HalTcpClient client(hal);
-    client.Connect("example.com", 80);
-    EXPECT_TRUE(hal.HasTcpCallbacks());
+    HalTcpClient dead(hal);
+    // Written through only if the route outlives the client.
+    dead.OnData([&](std::string_view) { observed = -1; });
+    ASSERT_TRUE(dead.Connect("example.com", 80).has_value());
   }
-  // The HAL outlives the client, so a leftover closure would dangle.
-  EXPECT_FALSE(hal.HasTcpCallbacks());
+
+  // The pool hands a released cid straight back out, so the next connection can
+  // land on the same one.
+  hal.SetNextConnectId(0);
+  HalTcpClient live(hal);
+  live.OnData([&](std::string_view) { ++observed; });
+  ASSERT_TRUE(live.Connect("example.com", 80).has_value());
+
+  hal.EmitTcpData(0, "hello");
+
+  EXPECT_EQ(observed, 1);
 }
 
 }  // namespace

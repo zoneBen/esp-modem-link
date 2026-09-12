@@ -91,18 +91,22 @@ class MockHal : public IModuleHal {
     return static_cast<int>(len);
   }
 
-  // Drive the callback the client installed, the way the AT layer does when a
-  // +MIPURC: "rudp" URC arrives.
+  // Drive the URC path the way the AT layer does when a +MIPURC: "rudp" line
+  // arrives. The HAL does the routing, so this calls the same helper Ml307Hal
+  // calls; going around it would test a path the hardware never takes.
   void EmitUdpData(int connect_id,
                    std::string_view host,
                    uint16_t port,
                    std::string_view data) {
-    if (on_udp_data_) on_udp_data_(connect_id, host, port, data);
+    DispatchUdpData(connect_id, host, port, data);
   }
-  bool HasUdpCallback() const { return static_cast<bool>(on_udp_data_); }
 
   bool fail_udp_open = false;
   bool fail_udp_send = false;
+
+  // Lets a test hand the next connection a cid an earlier one used, which is what
+  // the pool does once a socket is released.
+  void SetNextConnectId(int id) { next_connect_id = id; }
 
   std::string last_open_host;
   uint16_t last_open_port = 0;
@@ -205,16 +209,8 @@ TEST(HalUdpClientTest, SendFailurePropagatesError) {
   EXPECT_FALSE(client.Send(data, 5).has_value());
 }
 
-// The unsolicited half. A datagram the HAL decodes but the client never
-// subscribes to is silently dropped, so these assert delivery end to end.
-
-TEST(HalUdpClientTest, ConnectRegistersCallbackWithHal) {
-  MockHal hal;
-  HalUdpClient client(hal);
-
-  ASSERT_TRUE(client.Connect("example.com", 53).has_value());
-  EXPECT_TRUE(hal.HasUdpCallback());
-}
+// The unsolicited half. A datagram the HAL decodes but no route was registered
+// for is silently dropped, so these assert delivery end to end.
 
 TEST(HalUdpClientTest, InboundDatagramReachesOnMessage) {
   MockHal hal;
@@ -286,15 +282,58 @@ TEST(HalUdpClientTest, DisconnectedClientDoesNotReceiveDatagrams) {
   EXPECT_FALSE(called);
 }
 
-TEST(HalUdpClientTest, DestructorUnregistersCallback) {
+// Two sockets on one HAL. With a single slot for inbound datagrams the second
+// Connect took the route away from the first.
+TEST(HalUdpClientTest, TwoClientsEachReceiveTheirOwnDatagrams) {
   MockHal hal;
+  HalUdpClient first(hal);
+  HalUdpClient second(hal);
+
+  std::string first_got;
+  std::string second_got;
+  first.OnMessage([&](std::string_view, uint16_t, std::string_view data) {
+    first_got = std::string(data);
+  });
+  second.OnMessage([&](std::string_view, uint16_t, std::string_view data) {
+    second_got = std::string(data);
+  });
+  ASSERT_TRUE(first.Connect("a.example", 53).has_value());
+  ASSERT_TRUE(second.Connect("b.example", 53).has_value());
+
+  hal.EmitUdpData(1, "1.1.1.1", 53, "for the second");
+  hal.EmitUdpData(0, "1.1.1.1", 53, "for the first");
+
+  EXPECT_EQ(first_got, "for the first");
+  EXPECT_EQ(second_got, "for the second");
+}
+
+// What withdrawal is for: the HAL outlives its clients, so a route that survives
+// its client is a call into freed memory rather than a leak. Either of the two
+// paths out of the destructor would clear this on its own; removing both is what
+// this catches.
+TEST(HalUdpClientTest, ADestroyedClientStopsReceiving) {
+  MockHal hal;
+  int observed = 0;
   {
-    HalUdpClient client(hal);
-    ASSERT_TRUE(client.Connect("example.com", 53).has_value());
-    EXPECT_TRUE(hal.HasUdpCallback());
+    HalUdpClient dead(hal);
+    // Written through only if the route outlives the client.
+    dead.OnMessage([&](std::string_view, uint16_t, std::string_view) {
+      observed = -1;
+    });
+    ASSERT_TRUE(dead.Connect("example.com", 53).has_value());
   }
-  // The HAL outlives the client, so a leftover closure would dangle.
-  EXPECT_FALSE(hal.HasUdpCallback());
+
+  // The pool hands a released cid straight back out, so the next connection can
+  // land on the same one.
+  hal.SetNextConnectId(0);
+  HalUdpClient live(hal);
+  live.OnMessage(
+      [&](std::string_view, uint16_t, std::string_view) { ++observed; });
+  ASSERT_TRUE(live.Connect("example.com", 53).has_value());
+
+  hal.EmitUdpData(0, "1.1.1.1", 53, "hello");
+
+  EXPECT_EQ(observed, 1);
 }
 
 }  // namespace

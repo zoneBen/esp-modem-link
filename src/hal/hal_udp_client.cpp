@@ -8,9 +8,11 @@ HalUdpClient::~HalUdpClient() {
   if (connected_) {
     Disconnect();
   }
-  // The HAL outlives this client and holds this closure, so drop it rather than
-  // leave it pointing at a destroyed 'this'.
-  hal_.SetUdpDataCallback(nullptr);
+  // Normally finds nothing: Disconnect() already withdrew. It is here so that no
+  // path out of this object can leave the HAL - which outlives every client -
+  // holding a closure into freed memory.
+  hal_.Unsubscribe(subscription_);
+  subscription_ = 0;
 }
 
 Result<> HalUdpClient::Connect(std::string_view host, uint16_t port) {
@@ -29,7 +31,8 @@ Result<> HalUdpClient::Connect(std::string_view host, uint16_t port) {
   remote_port_ = port;
   connected_ = true;
 
-  hal_.SetUdpDataCallback(
+  subscription_ = hal_.SubscribeUdp(
+      connect_id_,
       [this](int id, std::string_view src_host, uint16_t src_port,
              std::string_view data) {
         OnUdpData(id, src_host, src_port, data);
@@ -37,12 +40,12 @@ Result<> HalUdpClient::Connect(std::string_view host, uint16_t port) {
   return {};
 }
 
-void HalUdpClient::OnUdpData(int connect_id,
+// The HAL routes by cid, so this only ever sees this client's own socket.
+void HalUdpClient::OnUdpData(int /*connect_id*/,
                              std::string_view host,
                              uint16_t port,
                              std::string_view data) {
-  // The HAL reports every socket; only this client's connection is ours.
-  if (connect_id != connect_id_ || !on_message_) return;
+  if (!on_message_) return;
   // Not every module reports the datagram's source, so fall back to the peer
   // this socket was opened against. On a connected UDP socket that is the only
   // address a datagram can arrive from.
@@ -65,6 +68,12 @@ void HalUdpClient::Disconnect() {
   int id = connect_id_;
   connect_id_ = -1;
   connected_ = false;
+
+  // Withdrawn before the close, by handle rather than by cid: the pool may
+  // already have handed this cid to another client, and a withdrawal by cid
+  // would take that client's route with it.
+  hal_.Unsubscribe(subscription_);
+  subscription_ = 0;
 
   hal_.UdpClose(id);
 }

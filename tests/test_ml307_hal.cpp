@@ -1016,11 +1016,13 @@ TEST_F(Ml307HalTest, TcpDataUrcReachesCallback) {
 
   std::string received;
   int received_id = -1;
-  hal_->SetTcpDataCallback(
+  hal_->SubscribeTcp(
+      0,
       [&](int cid, std::string_view data) {
         received_id = cid;
         received = std::string(data);
-      });
+      },
+      nullptr);  // this test is about payload, not the close
 
   // Inbound payload arrives as +MIPURC: "rtcp",<id>,<len>,<hex>.
   channel_.InjectUrc("+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\n");
@@ -1037,8 +1039,9 @@ TEST_F(Ml307HalTest, TcpRtcpUrcReachesCallback) {
   ASSERT_TRUE(id.has_value());
 
   std::string received;
-  hal_->SetTcpDataCallback(
-      [&](int, std::string_view data) { received = std::string(data); });
+  hal_->SubscribeTcp(
+      0, [&](int, std::string_view data) { received = std::string(data); },
+      nullptr);
 
   channel_.InjectUrc("+MIPRTCP: 0,5,\"68656c6c6f\"\r\n");
 
@@ -1052,7 +1055,8 @@ TEST_F(Ml307HalTest, UdpDataUrcReachesCallback) {
 
   std::string received;
   int received_id = -1;
-  hal_->SetUdpDataCallback(
+  hal_->SubscribeUdp(
+      0,
       [&](int cid, std::string_view, uint16_t, std::string_view data) {
         received_id = cid;
         received = std::string(data);
@@ -1076,8 +1080,8 @@ TEST_F(Ml307HalTest, UdpDataUrcReportsSourceWhenPresent) {
 
   std::string host;
   uint16_t port = 0;
-  hal_->SetUdpDataCallback(
-      [&](int, std::string_view h, uint16_t p, std::string_view) {
+  hal_->SubscribeUdp(
+      0, [&](int, std::string_view h, uint16_t p, std::string_view) {
         host = std::string(h);
         port = p;
       });
@@ -1095,7 +1099,8 @@ TEST_F(Ml307HalTest, UdpDataUrcDoesNotReachTcpCallback) {
   ASSERT_TRUE(hal_->TcpConnect("example.com", 80).has_value());
 
   bool tcp_called = false;
-  hal_->SetTcpDataCallback([&](int, std::string_view) { tcp_called = true; });
+  hal_->SubscribeTcp(
+      0, [&](int, std::string_view) { tcp_called = true; }, nullptr);
 
   channel_.InjectUrc("+MIPURC: \"rudp\",0,5,\"68656c6c6f\"\r\n");
 
@@ -1109,7 +1114,7 @@ TEST_F(Ml307HalTest, TcpCloseUrcReleasesSlotAndNotifies) {
 
   bool closed = false;
   int closed_id = -1;
-  hal_->SetTcpCloseCallback([&](int cid) {
+  hal_->SubscribeTcp(0, nullptr, [&](int cid) {
     closed = true;
     closed_id = cid;
   });
@@ -1133,7 +1138,7 @@ TEST_F(Ml307HalTest, MipUrcDisconnectReleasesSlotAndNotifies) {
   ASSERT_TRUE(id.has_value());
 
   bool closed = false;
-  hal_->SetTcpCloseCallback([&](int) { closed = true; });
+  hal_->SubscribeTcp(0, nullptr, [&](int) { closed = true; });
 
   // Peer-initiated close arrives as +MIPURC: "disconn",<id>.
   channel_.InjectUrc("+MIPURC: \"disconn\",0\r\n");

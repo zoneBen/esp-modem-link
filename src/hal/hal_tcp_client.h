@@ -25,6 +25,7 @@ class HalTcpClient : public TcpClient {
 
   IModuleHal& hal_;
   bool ssl_ = false;
+  HalSubscription subscription_ = 0;
   int connect_id_ = -1;
 };
 

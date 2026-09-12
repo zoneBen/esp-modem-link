@@ -891,9 +891,7 @@ void Ml307Hal::OnMipcloseUrc(std::string_view /*command*/,
   if (!id) return;
 
   ReleaseConnectionId(*id);
-  if (on_tcp_close_) {
-    on_tcp_close_(*id);
-  }
+  DispatchTcpClose(*id);
 }
 
 void Ml307Hal::OnMiprtcpUrc(std::string_view /*command*/,
@@ -910,11 +908,9 @@ void Ml307Hal::OnMiprtcpUrc(std::string_view /*command*/,
   auto hex_data = StripQuotes(fields[2]);
   auto data = at_parser::ParseHex(hex_data);
 
-  if (on_tcp_data_) {
-    on_tcp_data_(*id,
-                 std::string_view(reinterpret_cast<const char*>(data.data()),
-                                  data.size()));
-  }
+  DispatchTcpData(*id,
+                  std::string_view(reinterpret_cast<const char*>(data.data()),
+                                   data.size()));
 }
 
 void Ml307Hal::OnMipUrc(std::string_view /*command*/, std::string_view args) {
@@ -935,11 +931,9 @@ void Ml307Hal::OnMipUrc(std::string_view /*command*/, std::string_view args) {
     // +MIPURC: "rtcp",<id>,<len>,<hex data>
     if (fields.size() < 4) return;
     auto data = at_parser::ParseHex(StripQuotes(fields[3]));
-    if (on_tcp_data_) {
-      on_tcp_data_(*id, std::string_view(
-                            reinterpret_cast<const char*>(data.data()),
-                            data.size()));
-    }
+    DispatchTcpData(*id, std::string_view(
+                              reinterpret_cast<const char*>(data.data()),
+                              data.size()));
   } else if (event == "rudp") {
     // +MIPURC: "rudp",<id>,<len>,<hex data>
     // The reference implementation for this module family reads exactly these
@@ -947,24 +941,20 @@ void Ml307Hal::OnMipUrc(std::string_view /*command*/, std::string_view args) {
     // is treated as optional rather than assumed.
     if (fields.size() < 4) return;
     auto data = at_parser::ParseHex(StripQuotes(fields[3]));
-    if (on_udp_data_) {
-      std::string_view host;
-      uint16_t port = 0;
-      if (fields.size() >= 6) {
-        host = StripQuotes(fields[4]);
-        if (auto parsed = ParseInt(fields[5])) {
-          port = static_cast<uint16_t>(*parsed);
-        }
+    std::string_view host;
+    uint16_t port = 0;
+    if (fields.size() >= 6) {
+      host = StripQuotes(fields[4]);
+      if (auto parsed = ParseInt(fields[5])) {
+        port = static_cast<uint16_t>(*parsed);
       }
-      on_udp_data_(*id, host, port,
-                   std::string_view(reinterpret_cast<const char*>(data.data()),
-                                    data.size()));
     }
+    DispatchUdpData(*id, host, port,
+                    std::string_view(reinterpret_cast<const char*>(data.data()),
+                                     data.size()));
   } else if (event == "disconn") {
     ReleaseConnectionId(*id);
-    if (on_tcp_close_) {
-      on_tcp_close_(*id);
-    }
+    DispatchTcpClose(*id);
   }
 }
 

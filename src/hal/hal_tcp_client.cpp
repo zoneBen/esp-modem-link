@@ -11,10 +11,12 @@ HalTcpClient::~HalTcpClient() {
   if (connected_) {
     Disconnect();
   }
-  // The HAL outlives this client and holds these closures, so drop them rather
-  // than leave them pointing at a destroyed 'this'.
-  hal_.SetTcpDataCallback(nullptr);
-  hal_.SetTcpCloseCallback(nullptr);
+  // Normally finds nothing: Disconnect() withdraws for a connected client, and a
+  // peer close has already had its route erased by the HAL. It is here so that no
+  // path out of this object can leave the HAL - which outlives every client -
+  // holding a closure into freed memory.
+  hal_.Unsubscribe(subscription_);
+  subscription_ = 0;
 }
 
 Result<> HalTcpClient::Connect(std::string_view host, uint16_t port) {
@@ -31,12 +33,13 @@ Result<> HalTcpClient::Connect(std::string_view host, uint16_t port) {
   connect_id_ = result.value();
   connected_ = true;
 
-  // Inbound payload and peer closes arrive unsolicited, so the HAL needs a
-  // route back to this client's user callbacks. The HAL accepts a single
-  // subscriber per direction, which is why one client owns it for its lifetime.
-  hal_.SetTcpDataCallback(
-      [this](int id, std::string_view data) { OnTcpData(id, data); });
-  hal_.SetTcpCloseCallback([this](int id) { OnTcpClose(id); });
+  // Inbound payload and peer closes arrive unsolicited, so the HAL needs a route
+  // back to this client's user callbacks. The subscription is per connection, so
+  // several clients share the HAL without seeing each other's traffic.
+  subscription_ = hal_.SubscribeTcp(
+      connect_id_,
+      [this](int id, std::string_view data) { OnTcpData(id, data); },
+      [this](int id) { OnTcpClose(id); });
 
   return {};
 }
@@ -49,6 +52,13 @@ void HalTcpClient::Disconnect() {
   int id = connect_id_;
   connect_id_ = -1;
   connected_ = false;
+
+  // Withdrawn before the close so the URC the close provokes arrives with nobody
+  // listening, rather than being delivered as a peer close. By handle rather
+  // than by cid, because the pool may already have handed this cid to another
+  // client - and a withdrawal by cid would take that client's route with it.
+  hal_.Unsubscribe(subscription_);
+  subscription_ = 0;
 
   hal_.TcpClose(id);
 
@@ -69,15 +79,13 @@ size_t HalTcpClient::GetSendBufferFree() const {
   return SIZE_MAX;
 }
 
-void HalTcpClient::OnTcpData(int connect_id, std::string_view data) {
-  // The HAL reports every socket; only this client's connection is ours.
-  if (connect_id != connect_id_ || !on_data_) return;
+// The HAL routes by cid, so these only ever see this client's own connection.
+void HalTcpClient::OnTcpData(int /*connect_id*/, std::string_view data) {
+  if (!on_data_) return;
   on_data_(data);
 }
 
-void HalTcpClient::OnTcpClose(int connect_id) {
-  if (connect_id != connect_id_) return;
-
+void HalTcpClient::OnTcpClose(int /*connect_id*/) {
   connect_id_ = -1;
   connected_ = false;
   if (on_disconnected_) {
