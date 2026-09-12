@@ -436,12 +436,18 @@ Result<int> Ml307Hal::UdpSend(int connect_id, const void* data, size_t len) {
 
 // === Built-in protocols ===
 
+// Both return false until the firmware's own stacks are implemented. The module
+// does have them - MIPHTTP and MIPMQTT - so this is a statement about what this
+// HAL can currently construct, not about the hardware. It has to be false
+// meanwhile: the capability is what sends an Auto-mode request down the builtin
+// path, and a builtin path that cannot produce a client fails the request
+// outright rather than letting it fall through to the software engine.
 bool Ml307Hal::HasBuiltinHttp() const {
-  return true;
+  return false;
 }
 
 bool Ml307Hal::HasBuiltinMqtt() const {
-  return true;
+  return false;
 }
 
 // === Internal helpers ===

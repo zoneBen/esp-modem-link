@@ -37,10 +37,15 @@ Result<std::unique_ptr<HttpClient>> CellularNetwork::CreateHttp() {
   const auto& caps = hal_.GetCapabilities();
 
   // Builtin where the firmware has an HTTP stack, unless the caller has asked
-  // for the software engine specifically.
+  // for the software engine specifically. A builtin stack that will not come up
+  // is not the end of the request in Auto mode: the module can still carry
+  // HTTP/1.1 over a raw socket, and asking for the builtin one was this layer's
+  // preference rather than the caller's requirement. An explicit kBuiltin is a
+  // requirement, so its failure is reported instead of being papered over.
   if (protocol_mode_ != ProtocolMode::kSoftware && caps.http &&
       hal_.HasBuiltinHttp()) {
-    return hal_.CreateBuiltinHttp();
+    auto builtin = hal_.CreateBuiltinHttp();
+    if (builtin || protocol_mode_ == ProtocolMode::kBuiltin) return builtin;
   }
 
   // Otherwise HTTP/1.1 runs over a raw socket from the same HAL, so a module
@@ -65,6 +70,9 @@ Result<std::unique_ptr<HttpClient>> CellularNetwork::CreateHttp() {
 }
 
 Result<std::unique_ptr<MqttClient>> CellularNetwork::CreateMqtt() {
+  // No fallback here yet, unlike HTTP: the software engine this would fall back
+  // to does not exist, so a failed builtin attempt has nothing to land on. It
+  // will take the same shape as CreateHttp once it does.
   if (protocol_mode_ != ProtocolMode::kSoftware && hal_.HasBuiltinMqtt()) {
     return hal_.CreateBuiltinMqtt();
   }

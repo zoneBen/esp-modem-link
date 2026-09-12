@@ -4,11 +4,15 @@
 #include <string>
 
 #include "hal/imodule_hal.h"
+#include "mock_at_channel.h"
+#include "modules/ml307/ml307_hal.h"
 #include "network/cellular_network.h"
 
 using namespace esp_modem_link;
 using namespace esp_modem_link::hal;
 using namespace esp_modem_link::network;
+using esp_modem_link::modules::ml307::Ml307Hal;
+using esp_modem_link::testing::MockAtChannel;
 
 namespace {
 
@@ -214,12 +218,69 @@ TEST(CellularNetworkTest, CreateUdpFailsWithoutUdpCap) {
   EXPECT_FALSE(result.has_value());
 }
 
-TEST(CellularNetworkTest, CreateHttpUsesBuiltin) {
+// The smallest thing that is not the software engine, so a test can tell which
+// of the two CreateHttp produced.
+class StubHttpClient : public HttpClient {
+ public:
+  void SetTimeout(std::chrono::milliseconds) override {}
+  void SetHeader(std::string_view, std::string_view) override {}
+  void SetBody(std::string) override {}
+  void SetKeepAlive(bool) override {}
+  void SetTlsConfig(const TlsConfig&) override {}
+  Result<HttpResponse> Execute(std::string_view, std::string_view) override {
+    return HttpResponse{};
+  }
+  Result<> Open(std::string_view, std::string_view) override { return {}; }
+  Result<int> Read(void*, size_t) override { return 0; }
+  Result<int> Write(const void*, size_t) override { return 0; }
+  void Close() override {}
+  Result<int> GetStatusCode() override { return 200; }
+  std::string GetResponseHeader(std::string_view) const override {
+    return {};
+  }
+  size_t GetContentLength() const override { return 0; }
+};
+
+// A module whose firmware HTTP stack does come up.
+class BuiltinHttpHal : public FullCapsHal {
+ public:
+  Result<std::unique_ptr<HttpClient>> CreateBuiltinHttp() override {
+    return std::unique_ptr<HttpClient>(std::make_unique<StubHttpClient>());
+  }
+};
+
+TEST(CellularNetworkTest, CreateHttpPrefersBuiltinWhenItComesUp) {
+  BuiltinHttpHal hal;
+  CellularNetwork net(hal);
+
+  auto result = net.CreateHttp();
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_NE(dynamic_cast<StubHttpClient*>(result->get()), nullptr);
+}
+
+// FullCapsHal claims a builtin HTTP stack and then cannot produce a client - the
+// state the ML307 HAL itself was in. Auto mode asked for the builtin as a
+// preference, so a failure there must not fail the request: the module can still
+// carry HTTP/1.1 over a raw socket.
+TEST(CellularNetworkTest, CreateHttpFallsBackToSoftwareWhenBuiltinFails) {
   FullCapsHal hal;
   CellularNetwork net(hal);
-  // FullCapsHal has builtin HTTP but CreateBuiltinHttp returns NotSupported
+
   auto result = net.CreateHttp();
-  // Should try builtin, which returns NotSupported from our mock
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  // Anything but the builtin path, which by construction produced nothing.
+  EXPECT_EQ(dynamic_cast<StubHttpClient*>(result->get()), nullptr);
+}
+
+// The fallback is Auto's privilege, not a blanket rule. A caller who named the
+// builtin engine asked for that engine, and silently running something else
+// would hide the reason their request never reached the firmware stack.
+TEST(CellularNetworkTest, CreateHttpReportsFailureWhenBuiltinIsRequired) {
+  FullCapsHal hal;
+  CellularNetwork net(hal);
+  net.SetProtocolMode(ProtocolMode::kBuiltin);
+
+  auto result = net.CreateHttp();
   EXPECT_FALSE(result.has_value());
 }
 
@@ -307,6 +368,25 @@ TEST(CellularNetworkTest, HttpsOverAModuleWithoutTlsFails) {
   auto result = client.value()->Execute("GET", "https://example.com/");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+}
+
+// The whole defect, end to end and on the real HAL: ML307 claimed a builtin HTTP
+// stack it could not construct, and Auto mode took that claim at face value, so
+// CreateHttp() failed outright on the one module this library currently drives.
+// The mock HALs above can only state the rule; this states that the module obeys
+// it.
+TEST(CellularNetworkTest, CreateHttpOnMl307GivesAWorkingClient) {
+  MockAtChannel channel;
+  channel.ExpectCommand("ATE0").Respond("OK\r\n");
+  channel.ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+
+  Ml307Hal hal;
+  ASSERT_TRUE(hal.Initialize(channel).has_value());
+
+  CellularNetwork net(hal);
+  auto client = net.CreateHttp();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  EXPECT_NE(client.value(), nullptr);
 }
 
 }  // namespace

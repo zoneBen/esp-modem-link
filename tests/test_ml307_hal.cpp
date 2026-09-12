@@ -94,8 +94,11 @@ TEST_F(Ml307HalTest, Capabilities) {
   // Six, per AT+MIPCFG=? reporting "cid",(0-5).
   EXPECT_EQ(caps.max_connections, 6);
   EXPECT_EQ(caps.max_baud_rate, 921600);
-  EXPECT_TRUE(hal_->HasBuiltinHttp());
-  EXPECT_TRUE(hal_->HasBuiltinMqtt());
+  // The module has MIPHTTP and MIPMQTT, but this HAL cannot construct clients
+  // for them yet, and Auto mode reads these flags as "the builtin path will
+  // work". Returning true here fails every Auto-mode HTTP request.
+  EXPECT_FALSE(hal_->HasBuiltinHttp());
+  EXPECT_FALSE(hal_->HasBuiltinMqtt());
 }
 
 // --- Initialize ---
