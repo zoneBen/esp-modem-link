@@ -42,7 +42,13 @@ if(NOT googletest_POPULATED)
       test_cellular_network.cpp
       test_cellular_device.cpp
       test_http_parser.cpp
+      test_mqtt_packet.cpp
+      test_software_mqtt_client.cpp
       test_http_request_builder.cpp
+      test_http_redirect.cpp
+      test_ws_frame.cpp
+      test_ws_handshake.cpp
+      test_software_ws_client.cpp
       test_software_http_client.cpp
       test_ml307_hal.cpp
     )

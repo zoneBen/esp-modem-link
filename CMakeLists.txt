@@ -47,9 +47,15 @@ set(ESP_MODEM_LINK_PRIVATE_SOURCES
   src/network/cellular_network.cpp
   src/modules/module_registrations.cpp
   src/modules/ml307/ml307_hal.cpp
+  src/protocol/mqtt/mqtt_packet.cpp
+  src/protocol/mqtt/software_mqtt_client.cpp
   src/protocol/http/http_parser.cpp
   src/protocol/http/http_request_builder.cpp
+  src/protocol/http/http_redirect.cpp
   src/protocol/http/software_http_client.cpp
+  src/protocol/websocket/ws_frame.cpp
+  src/protocol/websocket/ws_handshake.cpp
+  src/protocol/websocket/software_ws_client.cpp
   src/device/cellular_device.cpp
 )
 
@@ -67,6 +73,7 @@ set(ESP_MODEM_LINK_PRIVATE_HEADERS
   src/platform/iuart.h
   src/platform/serial_uart.h
   src/platform/time.h
+  src/platform/random.h
   src/hal/imodule_hal.h
   src/hal/module_registry.h
   src/hal/hal_tcp_client.h
@@ -74,9 +81,15 @@ set(ESP_MODEM_LINK_PRIVATE_HEADERS
   src/network/cellular_network.h
   src/modules/module_registrations.h
   src/modules/ml307/ml307_hal.h
+  src/protocol/mqtt/mqtt_packet.h
+  src/protocol/mqtt/software_mqtt_client.h
   src/protocol/http/http_parser.h
   src/protocol/http/http_request_builder.h
+  src/protocol/http/http_redirect.h
   src/protocol/http/software_http_client.h
+  src/protocol/websocket/ws_frame.h
+  src/protocol/websocket/ws_handshake.h
+  src/protocol/websocket/software_ws_client.h
   src/device/cellular_device_impl.h
 )
 
@@ -117,6 +130,7 @@ endif()
 if(ESP_MODEM_LINK_PLATFORM STREQUAL "POSIX")
   target_sources(esp_modem_link PRIVATE
     platform/posix/posix_time.cpp
+    platform/posix/posix_random.cpp
     platform/posix/posix_task.cpp
     platform/posix/posix_event_group.cpp
     platform/posix/posix_timer.cpp

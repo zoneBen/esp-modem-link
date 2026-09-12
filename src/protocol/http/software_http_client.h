@@ -14,6 +14,8 @@
 #include "esp_modem_link/http_client.h"
 #include "esp_modem_link/tcp_client.h"
 #include "protocol/http/http_parser.h"
+#include "protocol/http/http_redirect.h"
+#include "protocol/http/http_request_builder.h"
 
 namespace esp_modem_link::protocol {
 
@@ -39,6 +41,8 @@ class SoftwareHttpClient : public HttpClient {
   void SetBody(std::string body) override;
   void SetKeepAlive(bool enable) override;
   void SetTlsConfig(const TlsConfig& config) override;
+  void SetFollowRedirects(bool enable) override;
+  void SetMaxRedirects(int max) override;
 
   // Sends the request and buffers the entire response. Returns once the body is
   // complete, so the result owns its data.
@@ -58,18 +62,43 @@ class SoftwareHttpClient : public HttpClient {
   size_t GetContentLength() const override;
 
  private:
+  // The request as it changes down a redirect chain: the method and body a 303
+  // rewrites, the headers a cross-origin hop prunes of its credentials, and the
+  // URL the next request goes to. It starts as a copy of what the caller
+  // configured, so nothing a redirect decides can be seen by the caller's
+  // setters.
+  struct RequestState {
+    std::string method;
+    ParsedUrl url;
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
+  };
+
   // Opens a transport for `url`, reusing the existing one when keep-alive is on
   // and it already points at the same host, port and security.
-  Result<> EnsureConnected(const struct ParsedUrl& url);
+  Result<> EnsureConnected(const ParsedUrl& url);
   void DropTransport();
 
-  Result<> StartRequest(std::string_view method,
-                        const struct ParsedUrl& url);
+  Result<> StartRequest(const RequestState& request);
+
+  // Waits until the response head has arrived and hands back its status and
+  // headers.
+  Result<HttpResponse> AwaitHeaders();
 
   // One attempt at the request. Execute() owns the decision to try again; this
   // is the whole of the work for a single try.
-  Result<HttpResponse> ExecuteOnce(std::string_view method,
-                                   const struct ParsedUrl& url);
+  Result<HttpResponse> ExecuteOnce(const RequestState& request);
+
+  // ExecuteOnce plus the single repeat a request with no side effect is allowed
+  // when the connection dies under it.
+  Result<HttpResponse> ExecuteAttempt(const RequestState& request);
+
+  // Applies one redirect to `request`, leaving it ready for the next hop. False
+  // when the response is not a redirect to follow, which leaves it as the
+  // caller's final answer.
+  Result<bool> ApplyRedirect(const HttpResponse& response,
+                             int hop,
+                             RequestState& request);
 
   // Transport callbacks, invoked from the AT layer's receive thread.
   void OnTransportData(std::string_view data);
@@ -88,6 +117,8 @@ class SoftwareHttpClient : public HttpClient {
   std::vector<std::pair<std::string, std::string>> headers_;
   std::string request_body_;
   bool keep_alive_ = false;
+  bool follow_redirects_ = true;
+  int max_redirects_ = kMaxRedirects;
   TlsConfig tls_;
 
   HttpParser parser_;

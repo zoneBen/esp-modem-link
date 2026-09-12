@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string_view>
@@ -55,7 +56,7 @@ class WebSocketClient {
   void OnError(ErrorCallback callback) { on_error_ = std::move(callback); }
   void OnPong(DataCallback callback) { on_pong_ = std::move(callback); }
 
-  bool IsConnected() const { return connected_; }
+  bool IsConnected() const { return connected_.load(); }
 
  protected:
   EventCallback on_connected_;
@@ -63,7 +64,9 @@ class WebSocketClient {
   DataCallback on_message_;
   ErrorCallback on_error_;
   DataCallback on_pong_;
-  bool connected_ = false;
+  // Atomic because the engine sets it from the transport's receive thread and
+  // the application reads it from its own.
+  std::atomic<bool> connected_{false};
 };
 
 }  // namespace esp_modem_link

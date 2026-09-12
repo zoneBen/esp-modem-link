@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string_view>
 
@@ -53,7 +54,7 @@ class MqttClient {
     on_publish_ack_ = std::move(callback);
   }
 
-  bool IsConnected() const { return connected_; }
+  bool IsConnected() const { return connected_.load(); }
 
  protected:
   EventCallback on_connected_;
@@ -61,7 +62,9 @@ class MqttClient {
   MessageCallback on_message_;
   ErrorCallback on_error_;
   PublishAckCallback on_publish_ack_;
-  bool connected_ = false;
+  // Atomic because the engine sets it from the transport's receive thread and
+  // the application reads it from its own.
+  std::atomic<bool> connected_{false};
 };
 
 }  // namespace esp_modem_link

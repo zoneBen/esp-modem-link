@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "protocol/http/http_request_builder.h"
+#include "protocol/http/http_redirect.h"
 
 namespace esp_modem_link::protocol {
 
@@ -41,6 +42,16 @@ void SoftwareHttpClient::SetBody(std::string body) {
 }
 
 void SoftwareHttpClient::SetKeepAlive(bool enable) { keep_alive_ = enable; }
+
+void SoftwareHttpClient::SetFollowRedirects(bool enable) {
+  follow_redirects_ = enable;
+}
+
+void SoftwareHttpClient::SetMaxRedirects(int max) {
+  // A negative limit is no limit at all, which is not something a client may
+  // offer a server: the chain has to end somewhere.
+  max_redirects_ = max < 0 ? 0 : max;
+}
 
 void SoftwareHttpClient::SetTlsConfig(const TlsConfig& config) {
   tls_ = config;
@@ -137,9 +148,8 @@ NetworkError SoftwareHttpClient::FailedError() const {
       NetworkError(NetworkErrc::kProtocolError, 0, "HTTP request failed"));
 }
 
-Result<> SoftwareHttpClient::StartRequest(std::string_view method,
-                                          const ParsedUrl& url) {
-  if (auto connected = EnsureConnected(url); !connected) {
+Result<> SoftwareHttpClient::StartRequest(const RequestState& request) {
+  if (auto connected = EnsureConnected(request.url); !connected) {
     return std::unexpected(connected.error());
   }
 
@@ -155,14 +165,14 @@ Result<> SoftwareHttpClient::StartRequest(std::string_view method,
   }
 
   HttpRequestOptions options;
-  options.method = std::string(method);
-  options.headers = headers_;
-  options.body = request_body_;
+  options.method = request.method;
+  options.headers = request.headers;
+  options.body = request.body;
   options.keep_alive = keep_alive_;
 
-  const std::string request = BuildHttpRequest(url, options);
+  const std::string rendered = BuildHttpRequest(request.url, options);
 
-  auto sent = transport_->Send(request.data(), request.size());
+  auto sent = transport_->Send(rendered.data(), rendered.size());
   if (!sent) {
     DropTransport();
     return std::unexpected(sent.error());
@@ -177,14 +187,38 @@ Result<HttpResponse> SoftwareHttpClient::Execute(std::string_view method,
     return std::unexpected(parsed.error());
   }
 
+  RequestState request;
+  request.method = std::string(method);
+  request.url = *parsed;
+  request.body = request_body_;
+  request.headers = headers_;
+
+  for (int hop = 0;; ++hop) {
+    auto result = ExecuteAttempt(request);
+    if (!result) {
+      return result;
+    }
+    auto followed = ApplyRedirect(*result, hop, request);
+    if (!followed) {
+      return std::unexpected(followed.error());
+    }
+    // Nothing left to follow: the response the server gave is the answer.
+    if (!*followed) {
+      return result;
+    }
+  }
+}
+
+Result<HttpResponse> SoftwareHttpClient::ExecuteAttempt(
+    const RequestState& request) {
   // A connection that ends with the body unfinished is a transport failure the
   // server may never have seen, so one repeat is worth trying - but only for a
   // request with no side effect. A POST cut short may well have been acted on
   // already, and repeating it could apply that action twice. PUT and DELETE are
   // idempotent by definition but still write, so they are not repeated either.
-  const bool repeatable = MethodIsRepeatable(method);
+  const bool repeatable = MethodIsRepeatable(request.method);
   for (int attempt = 0;; ++attempt) {
-    auto result = ExecuteOnce(method, *parsed);
+    auto result = ExecuteOnce(request);
     if (result || attempt > 0 || !repeatable ||
         result.error().code != NetworkErrc::kConnectionLost) {
       return result;
@@ -194,10 +228,83 @@ Result<HttpResponse> SoftwareHttpClient::Execute(std::string_view method,
   }
 }
 
-Result<HttpResponse> SoftwareHttpClient::ExecuteOnce(std::string_view method,
-                                                     const ParsedUrl& url) {
+Result<bool> SoftwareHttpClient::ApplyRedirect(const HttpResponse& response,
+                                               int hop,
+                                               RequestState& request) {
+  if (!IsRedirectStatus(response.status_code)) {
+    return false;
+  }
+
+  // Not following leaves the response as the server sent it, Location and all,
+  // which is what a caller that turned this off asked for. A limit of zero is
+  // the same answer as turning it off.
+  if (!follow_redirects_ || max_redirects_ == 0) {
+    return false;
+  }
+
+  // A redirect that names nowhere to go is the server's final answer, and the
+  // status and body that came with it are handed back rather than followed.
+  const std::string location = RedirectLocation(response);
+  if (location.empty()) {
+    return false;
+  }
+
+  // Checked before the hop is taken, so the limit bounds how many requests go
+  // out, and counted from zero for the first request: one initial request plus
+  // max_redirects redirects is the most that is ever sent.
+  if (hop >= max_redirects_) {
+    return std::unexpected(NetworkError(
+        NetworkErrc::kProtocolError, response.status_code,
+        "the request was redirected more than " + std::to_string(max_redirects_) +
+            " times"));
+  }
+
+  auto next = ResolveRedirect(request.url, location);
+  if (!next) {
+    return std::unexpected(next.error());
+  }
+
+  // A redirect that crosses origins does not take the credentials with it: an
+  // Authorization header belongs to the host it was written for, and a Location
+  // naming somebody else's server would hand that server the key. Everything
+  // else is the request the caller wrote, which still applies wherever it goes.
+  if (!SameOrigin(request.url, *next)) {
+    request.headers.erase(
+        std::remove_if(request.headers.begin(), request.headers.end(),
+                       [](const auto& header) {
+                         return IsCredentialHeader(header.first);
+                       }),
+        request.headers.end());
+  }
+
+  // 303, and 301/302 as clients have always read them, turn anything that was
+  // not a plain read into a GET: the server is saying the answer is elsewhere,
+  // and the body that was sent is not wanted there. 307 and 308 are the ones
+  // that mean "send exactly this again, somewhere else". Content-Length is
+  // derived from the body on the way out, so a dropped body drops it too.
+  if (response.status_code == 303 ||
+      ((response.status_code == 301 || response.status_code == 302) &&
+       request.method != "GET" && request.method != "HEAD")) {
+    request.method = "GET";
+    request.body.clear();
+  }
+
+  // A streaming caller has not read the body of the response being abandoned, so
+  // that connection cannot carry the next request: those bytes would arrive
+  // ahead of its answer. Execute() has read the body and may keep the socket for
+  // the next hop, which is what makes a chain of redirects one connection.
+  if (streaming_) {
+    DropTransport();
+  }
+
+  request.url = *next;
+  return true;
+}
+
+Result<HttpResponse> SoftwareHttpClient::ExecuteOnce(
+    const RequestState& request) {
   streaming_ = false;
-  if (auto started = StartRequest(method, url); !started) {
+  if (auto started = StartRequest(request); !started) {
     return std::unexpected(started.error());
   }
 
@@ -249,12 +356,35 @@ Result<> SoftwareHttpClient::Open(std::string_view method,
     return std::unexpected(parsed.error());
   }
 
-  streaming_ = true;
-  if (auto started = StartRequest(method, *parsed); !started) {
-    return std::unexpected(started.error());
-  }
+  RequestState request;
+  request.method = std::string(method);
+  request.url = *parsed;
+  request.body = request_body_;
+  request.headers = headers_;
 
-  // Return once the headers are in, so the status and headers can be read
+  streaming_ = true;
+  for (int hop = 0;; ++hop) {
+    if (auto started = StartRequest(request); !started) {
+      return std::unexpected(started.error());
+    }
+    auto head = AwaitHeaders();
+    if (!head) {
+      return std::unexpected(head.error());
+    }
+    auto followed = ApplyRedirect(*head, hop, request);
+    if (!followed) {
+      return std::unexpected(followed.error());
+    }
+    // The headers of the final response are the ones in the parser, which is
+    // what GetStatusCode() and GetResponseHeader() read from here on.
+    if (!*followed) {
+      return {};
+    }
+  }
+}
+
+Result<HttpResponse> SoftwareHttpClient::AwaitHeaders() {
+  // Returns once the headers are in, so the status and headers can be read
   // before any of the body has been consumed.
   std::unique_lock<std::mutex> lock(mutex_);
   cv_.wait_for(lock, timeout_, [this] {
@@ -276,7 +406,14 @@ Result<> SoftwareHttpClient::Open(std::string_view method,
         NetworkError(NetworkErrc::kTimeout, 0,
                      "timed out waiting for the HTTP response headers"));
   }
-  return {};
+
+  // The head is copied out here because a redirect is decided on the status and
+  // the Location, and for a response whose body has not been read those exist
+  // only in the parser, which the next attempt resets.
+  HttpResponse head;
+  head.status_code = parser_.GetStatusCode();
+  head.headers = parser_.GetHeaders();
+  return head;
 }
 
 Result<int> SoftwareHttpClient::Read(void* buffer, size_t size) {

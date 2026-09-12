@@ -26,6 +26,17 @@ class HttpClient {
   virtual void SetKeepAlive(bool enable) = 0;
   virtual void SetTlsConfig(const TlsConfig& config) = 0;
 
+  // Whether a 3xx is followed to the Location it names, and how many hops may
+  // be taken before the chain is treated as endless. Following is on by default
+  // with a small limit; a caller that wants to read the redirect itself - the
+  // status and its Location are in the response - can turn it off.
+  //
+  // Not every engine can honour this. One that leaves HTTP to the module's
+  // firmware has whatever redirect behaviour that firmware has, and a caller
+  // setting these on it is asking for something it does not do.
+  virtual void SetFollowRedirects(bool enable) { (void)enable; }
+  virtual void SetMaxRedirects(int max) { (void)max; }
+
   virtual Result<HttpResponse> Execute(std::string_view method,
                                        std::string_view url) = 0;
 

@@ -7,6 +7,8 @@
 #include "mock_at_channel.h"
 #include "modules/ml307/ml307_hal.h"
 #include "network/cellular_network.h"
+#include "protocol/mqtt/software_mqtt_client.h"
+#include "protocol/websocket/software_ws_client.h"
 
 using namespace esp_modem_link;
 using namespace esp_modem_link::hal;
@@ -284,12 +286,22 @@ TEST(CellularNetworkTest, CreateHttpReportsFailureWhenBuiltinIsRequired) {
   EXPECT_FALSE(result.has_value());
 }
 
-TEST(CellularNetworkTest, CreateWebSocketNotSupported) {
+TEST(CellularNetworkTest, CreateWebSocketIsAlwaysTheSoftwareEngine) {
   FullCapsHal hal;
   CellularNetwork net(hal);
-  auto result = net.CreateWebSocket();
-  EXPECT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+
+  auto client = net.CreateWebSocket();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  // Which engine came back is the whole point: no module has a WebSocket stack
+  // of its own, so a protocol mode that asks for one changes nothing here.
+  EXPECT_NE(dynamic_cast<protocol::SoftwareWsClient*>(client.value().get()),
+            nullptr);
+
+  net.SetProtocolMode(ProtocolMode::kBuiltin);
+  auto forced = net.CreateWebSocket();
+  ASSERT_TRUE(forced.has_value()) << forced.error().Message();
+  EXPECT_NE(dynamic_cast<protocol::SoftwareWsClient*>(forced.value().get()),
+            nullptr);
 }
 
 TEST(CellularNetworkTest, HasCapabilityTcp) {
@@ -298,10 +310,20 @@ TEST(CellularNetworkTest, HasCapabilityTcp) {
   EXPECT_TRUE(net.HasCapability(NetworkProtocol::kTcp));
 }
 
-TEST(CellularNetworkTest, HasCapabilityWebSocketFalse) {
-  FullCapsHal hal;
+// WebSocket has no builtin path on any module, so the only question the module
+// can answer is whether it can carry the socket underneath one.
+TEST(CellularNetworkTest, HasCapabilityWebSocket) {
+  TcpOnlyHal hal;
   CellularNetwork net(hal);
-  EXPECT_FALSE(net.HasCapability(NetworkProtocol::kWebSocket));
+  EXPECT_TRUE(net.HasCapability(NetworkProtocol::kWebSocket));
+
+  // A module with TCP but no TLS cannot carry wss://, which is a different
+  // question from whether it can carry ws://.
+  EXPECT_FALSE(net.HasCapability(NetworkProtocol::kWss));
+
+  NoCapsHal bare;
+  CellularNetwork none(bare);
+  EXPECT_FALSE(none.HasCapability(NetworkProtocol::kWebSocket));
 }
 
 TEST(CellularNetworkTest, GetMaxConnections) {
@@ -387,6 +409,129 @@ TEST(CellularNetworkTest, CreateHttpOnMl307GivesAWorkingClient) {
   auto client = net.CreateHttp();
   ASSERT_TRUE(client.has_value()) << client.error().Message();
   EXPECT_NE(client.value(), nullptr);
+}
+
+
+// --- MQTT engine selection ------------------------------------------------
+
+// Same rule as HTTP, on the MQTT path: a builtin stack that cannot be built
+// does not end the request in Auto mode, because the module can still carry
+// MQTT over a raw socket.
+TEST(CellularNetworkTest, AutoFallsBackToSoftwareMqttWhenTheBuiltinFails) {
+  FullCapsHal hal;  // claims a builtin MQTT stack, and cannot build one
+  CellularNetwork net(hal);
+
+  auto client = net.CreateMqtt();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  // Which engine came back is the whole point: a client that merely exists
+  // could be a stub.
+  EXPECT_NE(dynamic_cast<protocol::SoftwareMqttClient*>(client.value().get()),
+            nullptr);
+}
+
+TEST(CellularNetworkTest, AnExplicitBuiltinMqttFailureIsReported) {
+  FullCapsHal hal;
+  CellularNetwork net(hal);
+  net.SetProtocolMode(ProtocolMode::kBuiltin);
+
+  auto client = net.CreateMqtt();
+  ASSERT_FALSE(client.has_value());
+  EXPECT_EQ(client.error().code, NetworkErrc::kNotSupported);
+}
+
+TEST(CellularNetworkTest, ATcpOnlyModuleGetsTheSoftwareMqttEngine) {
+  TcpOnlyHal hal;
+  CellularNetwork net(hal);
+
+  auto client = net.CreateMqtt();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  EXPECT_NE(dynamic_cast<protocol::SoftwareMqttClient*>(client.value().get()),
+            nullptr);
+}
+
+TEST(CellularNetworkTest, MqttOnAModuleWithNoTcpAtAllFails) {
+  NoCapsHal hal;
+  CellularNetwork net(hal);
+
+  auto client = net.CreateMqtt();
+  ASSERT_FALSE(client.has_value());
+  EXPECT_EQ(client.error().code, NetworkErrc::kNotSupported);
+  // The message says which of the two ways out was missing, because "MQTT not
+  // available" on a module that has a socket but no MQTT is a different
+  // problem to go and solve.
+  EXPECT_NE(client.error().context.find("nor TCP"), std::string::npos);
+}
+
+TEST(CellularNetworkTest, MqttsOverAModuleWithoutTlsFails) {
+  TcpOnlyHal hal;
+  CellularNetwork net(hal);
+
+  auto client = net.CreateMqtt();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  TlsConfig config;
+  client.value()->SetTlsConfig(config);
+  auto result = client.value()->Connect("broker.example", 8883);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+}
+
+// The one module this library currently drives, end to end: ML307 has no MQTT
+// stack of its own, so it must get the software one rather than an error.
+TEST(CellularNetworkTest, CreateMqttOnMl307GivesAWorkingClient) {
+  MockAtChannel channel;
+  channel.ExpectCommand("ATE0").Respond("OK\r\n");
+  channel.ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+
+  Ml307Hal hal;
+  ASSERT_TRUE(hal.Initialize(channel).has_value());
+
+  CellularNetwork net(hal);
+  auto client = net.CreateMqtt();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  EXPECT_NE(dynamic_cast<protocol::SoftwareMqttClient*>(client.value().get()),
+            nullptr);
+}
+
+// --- WebSocket engine selection -------------------------------------------
+
+TEST(CellularNetworkTest, AWebSocketOnAModuleWithNoTcpAtAllFails) {
+  NoCapsHal hal;
+  CellularNetwork net(hal);
+
+  auto client = net.CreateWebSocket();
+  ASSERT_FALSE(client.has_value());
+  EXPECT_EQ(client.error().code, NetworkErrc::kNotSupported);
+}
+
+// The scheme is what asks for TLS, and a module without it cannot carry wss://.
+// The failure belongs to the connection rather than to the client's
+// construction, because ws:// would still have worked.
+TEST(CellularNetworkTest, WssOverAModuleWithoutTlsFails) {
+  TcpOnlyHal hal;
+  CellularNetwork net(hal);
+
+  auto client = net.CreateWebSocket();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  auto result = client.value()->Connect("wss://server.example/chat");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+}
+
+TEST(CellularNetworkTest, CreateWebSocketOnMl307GivesAWorkingClient) {
+  MockAtChannel channel;
+  channel.ExpectCommand("ATE0").Respond("OK\r\n");
+  channel.ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+
+  Ml307Hal hal;
+  ASSERT_TRUE(hal.Initialize(channel).has_value());
+
+  CellularNetwork net(hal);
+  auto client = net.CreateWebSocket();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+  EXPECT_NE(dynamic_cast<protocol::SoftwareWsClient*>(client.value().get()),
+            nullptr);
 }
 
 }  // namespace

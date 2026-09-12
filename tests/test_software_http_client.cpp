@@ -6,91 +6,15 @@
 #include <vector>
 
 #include "esp_modem_link/tcp_client.h"
+#include "mock_tcp_client.h"
+#include "protocol/http/http_redirect.h"
 #include "protocol/http/software_http_client.h"
 
 using namespace esp_modem_link;
 using namespace esp_modem_link::protocol;
+using namespace esp_modem_link::testing;
 
 namespace {
-
-// What a transport recorded while it was alive. Kept apart from the transport
-// itself because the client is entitled to destroy its transport - at the end
-// of a non-keep-alive request, and again on Close() - and the test still has to
-// see what happened first.
-struct MockState {
-  int connect_calls = 0;
-  int disconnect_calls = 0;
-  std::string last_host;
-  uint16_t last_port = 0;
-  bool was_tls = false;
-  TlsConfig last_tls_config;
-  std::string sent;
-};
-
-// A TcpClient that answers a request as soon as it is sent. Responding
-// synchronously from Send() keeps these tests deterministic while still
-// exercising the real path: the data callback is invoked from outside the
-// request code, exactly as the AT layer's receive thread does it.
-class MockTcpClient : public TcpClient {
- public:
-  struct Script {
-    std::string response;
-    bool respond = false;
-    bool close_after = false;
-    size_t chunk_size = 0;  // 0 = deliver the response in one piece
-    bool fail_connect = false;
-    bool fail_send = false;
-  };
-
-  MockTcpClient(std::shared_ptr<MockState> state, const Script& script)
-      : state_(std::move(state)), script_(script) {}
-
-  Result<> Connect(std::string_view host, uint16_t port) override {
-    state_->connect_calls++;
-    state_->last_host = std::string(host);
-    state_->last_port = port;
-    if (script_.fail_connect) {
-      return std::unexpected(
-          NetworkError(NetworkErrc::kConnectFailed, 0, "mock connect failed"));
-    }
-    connected_ = true;
-    return {};
-  }
-
-  void Disconnect() override {
-    connected_ = false;
-    state_->disconnect_calls++;
-  }
-
-  Result<int> Send(const void* data, size_t len) override {
-    state_->sent.append(static_cast<const char*>(data), len);
-    if (script_.fail_send) {
-      return std::unexpected(
-          NetworkError(NetworkErrc::kTransmitFailed, 0, "mock send failed"));
-    }
-    EmitResponse();
-    return static_cast<int>(len);
-  }
-
- private:
-  void EmitResponse() {
-    if (!script_.respond || !on_data_) return;
-    if (script_.chunk_size == 0) {
-      on_data_(script_.response);
-    } else {
-      std::string_view whole(script_.response);
-      for (size_t i = 0; i < whole.size(); i += script_.chunk_size) {
-        on_data_(whole.substr(i, script_.chunk_size));
-      }
-    }
-    if (script_.close_after && on_disconnected_) {
-      on_disconnected_();
-    }
-  }
-
-  std::shared_ptr<MockState> state_;
-  Script script_;
-};
 
 // The client builds its transport during the request, since only then is the
 // URL parsed and TLS known, so the script lives here and every transport the
@@ -142,6 +66,13 @@ class ClientUnderTest {
     responses_in_turn_ = std::move(responses);
   }
 
+  // One response per Send() on every transport, in order. This is what stages a
+  // redirect chain that keep-alive carries over a single connection, where the
+  // per-connection supply above would answer every hop with the same redirect.
+  void SetResponseSequence(std::vector<std::string> responses) {
+    script_.sequence = std::move(responses);
+  }
+
   MockState& transport(size_t index = 0) { return *state_.at(index); }
   size_t transport_count() const { return state_.size(); }
 
@@ -177,6 +108,19 @@ constexpr const char* kOkResponse =
     "Content-Length: 5\r\n"
     "\r\n"
     "hello";
+
+// A response that points somewhere else. The length is declared and zero, so
+// the client sees a whole response rather than one that is only finished when
+// the peer hangs up.
+std::string RedirectTo(int status, std::string_view location) {
+  return "HTTP/1.1 " + std::to_string(status) +
+         " Moved\r\n"
+         "Location: " +
+         std::string(location) +
+         "\r\n"
+         "Content-Length: 0\r\n"
+         "\r\n";
+}
 
 TEST(SoftwareHttpClientTest, ExecuteSendsAWellFormedRequest) {
   ClientUnderTest test;
@@ -611,6 +555,330 @@ TEST(SoftwareHttpClientTest, DestructorDisconnectsAnOpenTransport) {
   test.DestroyClient();
 
   EXPECT_EQ(test.transport().disconnect_calls, 1);
+}
+
+// --- Redirects ---
+
+TEST(SoftwareHttpClientTest, ExecuteFollowsARedirectToAnotherHost) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn(
+      {RedirectTo(302, "http://other.example/landing"), kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/start");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  // The caller is handed the answer to the request that was finally made, not
+  // the redirect that pointed at it.
+  EXPECT_EQ(result->status_code, 200);
+  EXPECT_EQ(result->body, "hello");
+
+  ASSERT_EQ(test.transport_count(), 2u);
+  EXPECT_EQ(test.transport(1).last_host, "other.example");
+  EXPECT_NE(test.transport(1).sent.find("GET /landing HTTP/1.1\r\n"),
+            std::string::npos);
+  EXPECT_NE(test.transport(1).sent.find("Host: other.example\r\n"),
+            std::string::npos);
+}
+
+TEST(SoftwareHttpClientTest, ExecuteFollowsARelativeRedirectOnTheSameHost) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "sibling"), kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/dir/page");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+
+  ASSERT_EQ(test.transport_count(), 2u);
+  EXPECT_EQ(test.transport(1).last_host, "example.com");
+  EXPECT_NE(test.transport(1).sent.find("GET /dir/sibling HTTP/1.1\r\n"),
+            std::string::npos);
+}
+
+// A chain that stays on one origin is carried over one socket, which is only
+// possible because the body of each response is read before the next request
+// goes out on it.
+TEST(SoftwareHttpClientTest, ExecuteFollowsAChainOverOneKeepAliveConnection) {
+  ClientUnderTest test;
+  test.client().SetKeepAlive(true);
+  test.SetResponseSequence(
+      {RedirectTo(302, "/first"), RedirectTo(308, "/second"), kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/start");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 200);
+
+  EXPECT_EQ(test.transport_count(), 1u);
+  EXPECT_EQ(test.transport().connect_calls, 1);
+  ASSERT_EQ(test.transport().sends.size(), 3u);
+  EXPECT_NE(test.transport().sent.find("GET /first HTTP/1.1\r\n"),
+            std::string::npos);
+  EXPECT_NE(test.transport().sent.find("GET /second HTTP/1.1\r\n"),
+            std::string::npos);
+}
+
+TEST(SoftwareHttpClientTest, A301TurnsAPostIntoAGetWithoutItsBody) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(301, "/moved"), kOkResponse});
+  test.client().SetBody("payload");
+
+  auto result = test.client().Execute("POST", "http://example.com/submit");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+
+  ASSERT_EQ(test.transport_count(), 2u);
+  EXPECT_EQ(test.transport(0).sent.rfind("POST /submit", 0), 0u);
+  EXPECT_EQ(test.transport(1).sent.rfind("GET /moved", 0), 0u);
+  // The body belongs to the request that was not made.
+  EXPECT_EQ(test.transport(1).sent.find("payload"), std::string::npos);
+  EXPECT_NE(test.transport(1).sent.find("Content-Length: 0\r\n"),
+            std::string::npos);
+}
+
+TEST(SoftwareHttpClientTest, A302AlsoTurnsAPostIntoAGet) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "/moved"), kOkResponse});
+  test.client().SetBody("payload");
+
+  ASSERT_TRUE(test.client().Execute("POST", "http://example.com/submit")
+                  .has_value());
+  EXPECT_EQ(test.transport(1).sent.rfind("GET /moved", 0), 0u);
+}
+
+// 303 is defined to mean "the answer is here, go and read it", whatever the
+// method was, so even a PUT that would hold its method elsewhere becomes a GET.
+TEST(SoftwareHttpClientTest, A303TurnsAnyMethodIntoAGet) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(303, "/see-other"), kOkResponse});
+  test.client().SetBody("payload");
+
+  ASSERT_TRUE(test.client().Execute("PUT", "http://example.com/thing")
+                  .has_value());
+  EXPECT_EQ(test.transport(1).sent.rfind("GET /see-other", 0), 0u);
+  EXPECT_EQ(test.transport(1).sent.find("payload"), std::string::npos);
+}
+
+// The other half of the rule: 307 and 308 say the request itself is to be
+// repeated somewhere else, so the method and the body go with it. A POST resent
+// as a bodyless GET would land as a different request altogether.
+TEST(SoftwareHttpClientTest, A307AndA308SendTheSameRequestSomewhereElse) {
+  for (int status : {307, 308}) {
+    ClientUnderTest test;
+    test.SetResponsesInTurn({RedirectTo(status, "/again"), kOkResponse});
+    test.client().SetBody("payload");
+
+    auto result = test.client().Execute("POST", "http://example.com/submit");
+    ASSERT_TRUE(result.has_value()) << result.error().Message();
+
+    ASSERT_EQ(test.transport_count(), 2u) << "status " << status;
+    EXPECT_EQ(test.transport(1).sent.rfind("POST /again", 0), 0u)
+        << "status " << status;
+    EXPECT_NE(test.transport(1).sent.find("payload"), std::string::npos)
+        << "status " << status;
+    EXPECT_NE(test.transport(1).sent.find("Content-Length: 7\r\n"),
+              std::string::npos)
+        << "status " << status;
+  }
+}
+
+// A server that keeps redirecting is not a resource, and a client that keeps
+// asking forever is worse than one that gives up.
+TEST(SoftwareHttpClientTest, ARedirectLoopStopsAtTheHopLimit) {
+  ClientUnderTest test;
+  test.SetResponse(RedirectTo(302, "/loop"));
+
+  auto result = test.client().Execute("GET", "http://example.com/loop");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kProtocolError);
+  EXPECT_NE(result.error().context.find("redirected more than"),
+            std::string::npos);
+  // The first request plus the allowed hops, and not one more.
+  EXPECT_EQ(test.transport_count(), static_cast<size_t>(kMaxRedirects) + 1);
+}
+
+// A caller that wants to read the redirect itself - to see where it points, or
+// to decide for their own reasons not to go there - can ask for it.
+TEST(SoftwareHttpClientTest, TurningRedirectsOffHandsBackTheRedirect) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "http://other.example/landing"),
+                           kOkResponse});
+  test.client().SetFollowRedirects(false);
+
+  auto result = test.client().Execute("GET", "http://example.com/start");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 302);
+  // The parser lowercases field names, so that is how they come back.
+  EXPECT_EQ(result->headers["location"], "http://other.example/landing");
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+TEST(SoftwareHttpClientTest, ALowerHopLimitStopsTheChainSooner) {
+  ClientUnderTest test;
+  test.SetResponse(RedirectTo(302, "/loop"));
+  test.client().SetMaxRedirects(1);
+
+  auto result = test.client().Execute("GET", "http://example.com/loop");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kProtocolError);
+  EXPECT_NE(result.error().context.find("more than 1 times"), std::string::npos);
+  // One request plus the one hop that was allowed.
+  EXPECT_EQ(test.transport_count(), 2u);
+}
+
+// A limit of zero is not a licence to follow forever, and not an error either:
+// it is the same answer as turning following off.
+TEST(SoftwareHttpClientTest, AZeroHopLimitIsTheSameAsTurningRedirectsOff) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "/somewhere"), kOkResponse});
+  test.client().SetMaxRedirects(0);
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 302);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+// A negative limit is not a way to ask for an unbounded chain.
+TEST(SoftwareHttpClientTest, ANegativeHopLimitFollowsNothing) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "/somewhere"), kOkResponse});
+  test.client().SetMaxRedirects(-1);
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 302);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+// There is nowhere to go, so the response the server sent is its answer. It is
+// handed back rather than turned into an error: a caller reading the status can
+// see for itself that it was a 302.
+TEST(SoftwareHttpClientTest, ARedirectWithoutALocationIsTheFinalAnswer) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn(
+      {"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 302);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+// 304 is a cache answer, not a redirect, even when it carries a Location.
+TEST(SoftwareHttpClientTest, A304IsNotFollowed) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn(
+      {"HTTP/1.1 304 Not Modified\r\nLocation: /new\r\nContent-Length: 0\r\n"
+       "\r\n",
+       kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 304);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+TEST(SoftwareHttpClientTest, ARedirectToASchemeItCannotSpeakFails) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "ftp://files.example/x"),
+                           kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kProtocolError);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+// Credentials belong to the host they were written for. Following a Location
+// onto somebody else's server with an Authorization header still attached would
+// hand that server the key, so the header is dropped for the hop across.
+TEST(SoftwareHttpClientTest, ACredentialIsNotSentToAnotherOrigin) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "http://other.example/landing"),
+                           kOkResponse});
+  test.client().SetHeader("Authorization", "Bearer secret");
+  test.client().SetHeader("X-Trace", "keep-me");
+
+  auto result = test.client().Execute("GET", "http://example.com/");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+
+  EXPECT_NE(test.transport(0).sent.find("Authorization: Bearer secret"),
+            std::string::npos);
+  EXPECT_EQ(test.transport(1).sent.find("secret"), std::string::npos);
+  EXPECT_EQ(test.transport(1).sent.find("Authorization"), std::string::npos);
+  // Everything that is not bound to the origin still applies where it lands.
+  EXPECT_NE(test.transport(1).sent.find("X-Trace: keep-me"), std::string::npos);
+}
+
+TEST(SoftwareHttpClientTest, ASameOriginRedirectKeepsTheCredential) {
+  ClientUnderTest test;
+  test.SetResponsesInTurn({RedirectTo(302, "http://example.com/other"),
+                           kOkResponse});
+  test.client().SetHeader("Authorization", "Bearer secret");
+
+  ASSERT_TRUE(test.client().Execute("GET", "http://example.com/").has_value());
+
+  ASSERT_EQ(test.transport_count(), 2u);
+  EXPECT_NE(test.transport(1).sent.find("Authorization: Bearer secret"),
+            std::string::npos);
+}
+
+// The same host at another port, or over another scheme, is another origin by
+// definition: what the credential is good for is that server, not that name.
+TEST(SoftwareHttpClientTest, AnotherPortOrSchemeIsAnotherOrigin) {
+  for (const char* location : {"http://example.com:8080/x",
+                               "https://example.com/x"}) {
+    ClientUnderTest test;
+    test.SetResponsesInTurn({RedirectTo(302, location), kOkResponse});
+    test.client().SetHeader("Authorization", "Bearer secret");
+
+    auto result = test.client().Execute("GET", "http://example.com/");
+    ASSERT_TRUE(result.has_value()) << result.error().Message();
+
+    ASSERT_EQ(test.transport_count(), 2u) << location;
+    EXPECT_EQ(test.transport(1).sent.find("secret"), std::string::npos)
+        << location;
+  }
+}
+
+// A socket to the host that answered cannot carry a request to a different
+// one, so a redirect that crosses hosts replaces the connection even when the
+// caller asked for keep-alive.
+TEST(SoftwareHttpClientTest, AKeepAliveRedirectToAnotherHostOpensASecondConnection) {
+  ClientUnderTest test;
+  test.client().SetKeepAlive(true);
+  test.SetResponsesInTurn(
+      {RedirectTo(302, "http://other.example/landing"), kOkResponse});
+
+  auto result = test.client().Execute("GET", "http://example.com/start");
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ(result->status_code, 200);
+
+  EXPECT_EQ(test.transport_count(), 2u);
+  EXPECT_EQ(test.transport(0).disconnect_calls, 1);
+  EXPECT_EQ(test.transport(1).last_host, "other.example");
+}
+
+TEST(SoftwareHttpClientTest, OpenFollowsARedirect) {  ClientUnderTest test;
+  test.client().SetKeepAlive(true);
+  test.SetResponsesInTurn({RedirectTo(302, "http://other.example/moved"),
+                           kOkResponse});
+
+  auto opened = test.client().Open("GET", "http://example.com/start");
+  ASSERT_TRUE(opened.has_value()) << opened.error().Message();
+
+  // What the caller reads after Open() is the final response's status, not the
+  // redirect that led to it.
+  auto status = test.client().GetStatusCode();
+  ASSERT_TRUE(status.has_value()) << status.error().Message();
+  EXPECT_EQ(*status, 200);
+
+  ASSERT_EQ(test.transport_count(), 2u);
+  // The connection the redirect came in on is closed rather than reused: its
+  // body was never read, so nothing left on that socket could be told apart
+  // from the answer to the next request.
+  EXPECT_EQ(test.transport(0).disconnect_calls, 1);
+  EXPECT_EQ(test.transport(1).last_host, "other.example");
+
+  auto body = Drain(test.client());
+  ASSERT_TRUE(body.has_value()) << body.error().Message();
+  EXPECT_EQ(*body, "hello");
 }
 
 }  // namespace

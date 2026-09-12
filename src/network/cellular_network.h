@@ -25,6 +25,11 @@ class CellularNetwork : public NetworkInterface {
   int GetMaxConnections(NetworkProtocol proto) const override;
 
  private:
+  // The transport the software protocol engines run on: a raw socket from the
+  // HAL, opened for TLS when the engine says it needs it. Shared by every
+  // engine so that "this module has no TLS" is answered in one place.
+  Result<std::unique_ptr<TcpClient>> OpenTransport(bool tls);
+
   hal::IModuleHal& hal_;
 };
 

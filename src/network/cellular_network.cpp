@@ -1,6 +1,8 @@
 #include "network/cellular_network.h"
 
 #include "protocol/http/software_http_client.h"
+#include "protocol/mqtt/software_mqtt_client.h"
+#include "protocol/websocket/software_ws_client.h"
 
 namespace esp_modem_link::network {
 
@@ -57,34 +59,64 @@ Result<std::unique_ptr<HttpClient>> CellularNetwork::CreateHttp() {
         "HTTP not available: the module has neither a builtin HTTP stack nor "
         "TCP"));
   }
-  return std::unique_ptr<HttpClient>(std::make_unique<protocol::SoftwareHttpClient>(
-      [this](bool tls,
-             const TlsConfig&) -> Result<std::unique_ptr<TcpClient>> {
-        if (tls && !hal_.GetCapabilities().ssl_tcp) {
-          return std::unexpected(NetworkError::NotSupported(
-              "HTTPS requires TLS, which this module does not support"));
-        }
-        return std::unique_ptr<TcpClient>(
-            std::make_unique<hal::HalTcpClient>(hal_, tls));
-      }));
+  return std::unique_ptr<HttpClient>(
+      std::make_unique<protocol::SoftwareHttpClient>(
+          [this](bool tls, const TlsConfig& config) {
+            (void)config;
+            return OpenTransport(tls);
+          }));
+}
+
+Result<std::unique_ptr<TcpClient>> CellularNetwork::OpenTransport(bool tls) {
+  if (tls && !hal_.GetCapabilities().ssl_tcp) {
+    return std::unexpected(NetworkError::NotSupported(
+        "TLS is required here, and this module does not support it"));
+  }
+  return std::unique_ptr<TcpClient>(
+      std::make_unique<hal::HalTcpClient>(hal_, tls));
 }
 
 Result<std::unique_ptr<MqttClient>> CellularNetwork::CreateMqtt() {
-  // No fallback here yet, unlike HTTP: the software engine this would fall back
-  // to does not exist, so a failed builtin attempt has nothing to land on. It
-  // will take the same shape as CreateHttp once it does.
-  if (protocol_mode_ != ProtocolMode::kSoftware && hal_.HasBuiltinMqtt()) {
-    return hal_.CreateBuiltinMqtt();
+  const auto& caps = hal_.GetCapabilities();
+
+  // Same shape as CreateHttp: the module's own MQTT stack is preferred in Auto
+  // mode, and a builtin one that will not come up is not the end of the request
+  // there either. An explicit kBuiltin is a requirement, so its failure is
+  // reported rather than dropped to software.
+  if (protocol_mode_ != ProtocolMode::kSoftware && caps.mqtt &&
+      hal_.HasBuiltinMqtt()) {
+    auto builtin = hal_.CreateBuiltinMqtt();
+    if (builtin || protocol_mode_ == ProtocolMode::kBuiltin) return builtin;
   }
-  return std::unexpected(
-      NetworkError::NotSupported(
-          "MQTT not available (software mode not implemented yet)"));
+
+  if (!caps.tcp) {
+    return std::unexpected(NetworkError::NotSupported(
+        "MQTT not available: the module has neither a builtin MQTT stack nor "
+        "TCP"));
+  }
+  return std::unique_ptr<MqttClient>(
+      std::make_unique<protocol::SoftwareMqttClient>(
+          [this](bool tls, const TlsConfig& config) {
+            (void)config;
+            return OpenTransport(tls);
+          }));
 }
 
 Result<std::unique_ptr<WebSocketClient>> CellularNetwork::CreateWebSocket() {
-  return std::unexpected(
-      NetworkError::NotSupported(
-          "WebSocket not available (software mode not implemented yet)"));
+  // No module in the registry has a WebSocket stack of its own, so there is no
+  // builtin path to prefer and nothing for ProtocolMode to choose between: RFC
+  // 6455 runs over a raw socket for every module that can carry TCP at all.
+  if (!hal_.GetCapabilities().tcp) {
+    return std::unexpected(NetworkError::NotSupported(
+        "WebSocket not available: the module has no TCP"));
+  }
+
+  // The scheme decides whether the socket is under TLS - wss:// against ws:// -
+  // so there is nothing for a caller to configure here, which is the one place
+  // this factory differs from the HTTP and MQTT ones.
+  return std::unique_ptr<WebSocketClient>(
+      std::make_unique<protocol::SoftwareWsClient>(
+          [this](bool tls) { return OpenTransport(tls); }));
 }
 
 bool CellularNetwork::HasCapability(NetworkProtocol proto) const {
@@ -103,8 +135,11 @@ bool CellularNetwork::HasCapability(NetworkProtocol proto) const {
     case NetworkProtocol::kMqtts:
       return caps.mqtt;
     case NetworkProtocol::kWebSocket:
+      // Software mode is the only mode there is for WebSocket, so the module's
+      // ability to carry one is exactly its ability to carry a socket.
+      return caps.tcp;
     case NetworkProtocol::kWss:
-      return false;
+      return caps.ssl_tcp;
   }
   return false;
 }
