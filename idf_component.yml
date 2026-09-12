@@ -1,0 +1,8 @@
+version: "0.1.0"
+description: "Multi-module AT cellular network library for ESP32"
+url: "https://github.com/zoneBen/esp-modem-link"
+dependencies:
+  idf: ">=5.5"
+  uart-uhci:
+    path: components/uart-uhci
+    git: https://github.com/liuzuan/uart_uhci.git

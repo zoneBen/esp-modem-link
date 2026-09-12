@@ -1,0 +1,34 @@
+menu "ESP Modem Link"
+
+    config ESP_MODEM_LINK_DEFAULT_BAUD
+        int "Default UART baud rate"
+        default 115200
+        help
+            Default baud rate for AT communication.
+            The driver will negotiate higher baud rates if supported.
+
+    config ESP_MODEM_LINK_RX_BUF_SIZE
+        int "UART RX buffer size"
+        default 4096
+        help
+            Size of the UART receive ring buffer in bytes.
+
+    config ESP_MODEM_LINK_TX_BUF_SIZE
+        int "UART TX buffer size"
+        default 4096
+        help
+            Size of the UART transmit buffer in bytes.
+
+    config ESP_MODEM_LINK_CMD_TIMEOUT_MS
+        int "Default AT command timeout (ms)"
+        default 5000
+        help
+            Default timeout for AT commands in milliseconds.
+
+    config ESP_MODEM_LINK_DEBUG_LOG
+        bool "Enable AT command debug logging"
+        default n
+        help
+            Log all AT commands and responses.
+
+endmenu

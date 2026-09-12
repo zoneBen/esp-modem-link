@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "posix-debug",
+      "displayName": "POSIX Debug",
+      "description": "POSIX platform, debug build, tests enabled",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/posix-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ESP_MODEM_LINK_PLATFORM": "POSIX",
+        "ESP_MODEM_LINK_BUILD_TESTS": "ON",
+        "ESP_MODEM_LINK_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "posix-release",
+      "displayName": "POSIX Release",
+      "description": "POSIX platform, release build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/posix-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ESP_MODEM_LINK_PLATFORM": "POSIX",
+        "ESP_MODEM_LINK_BUILD_TESTS": "OFF",
+        "ESP_MODEM_LINK_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "test-coverage",
+      "displayName": "Test Coverage",
+      "description": "POSIX debug with coverage flags",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/coverage",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ESP_MODEM_LINK_PLATFORM": "POSIX",
+        "ESP_MODEM_LINK_BUILD_TESTS": "ON",
+        "CMAKE_CXX_FLAGS": "--coverage -O0 -g",
+        "CMAKE_C_FLAGS": "--coverage -O0 -g"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "posix-debug", "configurePreset": "posix-debug" },
+    { "name": "posix-release", "configurePreset": "posix-release" },
+    { "name": "test-coverage", "configurePreset": "test-coverage" }
+  ],
+  "testPresets": [
+    {
+      "name": "posix-debug",
+      "configurePreset": "posix-debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFail": true }
+    }
+  ]
+}

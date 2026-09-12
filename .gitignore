@@ -1,0 +1,4 @@
+dist/
+.component_hash
+.idea
+build/
