@@ -395,10 +395,45 @@ public:
     virtual Result<int> Write(const void* buffer, size_t size) = 0;
     virtual void Close() = 0;
 
+    // 流式请求体（分块上传）。默认关。
+    //
+    // 与上面那条流式路径的关系，是本次设计里最容易读错的一处：Open() 在
+    // 普通模式下等到响应头才返回，而服务端不会回答一个还没读完请求体的请
+    // 求——所以开了分块上传之后 Open() 只发请求头就返回，响应头改由
+    // EndBody() 等待。EndBody() 之后的用法与普通 Open() 之后完全相同。
+    //
+    //   SetBody("")           // 清掉先前的 body，否则 Open() 拒绝
+    //   SetChunkedUpload(true)
+    //   Open("POST", url)     // 只发头，立即返回
+    //   Write(...)  ×N        // 每段一个块
+    //   EndBody()             // 终止块 + 等响应头
+    //   GetStatusCode() / Read() ×N
+    //   Close()
+    //
+    // Write() 的 size 为 0 是合法输入且什么都不发：零长度块就是终止块本身，
+    // 只有 EndBody() 能产出它。
+    //
+    // 与 SetBody() 互斥：调用方用 SetBody("") 清掉先前的 body，否则 Open() 报
+    // kInvalidArgument——先量好的 body 和流式上传不可能同时是这次请求的。
+    //
+    // 两条限制：重定向无法跟随（请求体已经送出，无法重放，会显式报错而不是
+    // 把 3xx 当作跟随成功交回）；HTTP/1.0 服务端不认识分块编码（症状是 4xx
+    // 或挂到 EndBody() 超时）。另外 Write() 只受传输层约束，不受 SetTimeout()
+    // 的期限约束——一次 Write() 在 AT 模组上是一串 AT+MIPSEND。
+    virtual void SetChunkedUpload(bool enable) { (void)enable; }
+
+    // 有默认实现且默认是失败的：返回 NotSupported，不是空实现。空实现返回的
+    // 是成功，会把没发生的上传报成完成。固件自带 HTTP 的引擎正是靠这一条兜
+    // 住——它的 SetChunkedUpload 只能是无操作。
+    virtual Result<> EndBody() {
+        return std::unexpected(NetworkError::NotSupported(...));
+    }
+
     // 流式模式下的响应信息
     virtual Result<int> GetStatusCode() = 0;
     virtual std::string GetResponseHeader(std::string_view key) const = 0;
     virtual size_t GetContentLength() const = 0;
+    // 说的是**响应**的分块，与 SetChunkedUpload() 的**请求**模式无关。
     virtual bool IsChunked() const = 0;
 };
 
@@ -854,6 +889,10 @@ void http_example(NetworkInterface& net) {
     }
     auto http = std::move(*http_result);
 
+    // 这个期限管的是等响应：Open() 等响应头、Read() 等 body、Execute() 等整
+    // 个响应。它不管 Write()——一次 Write() 在 AT 模组上是一串 AT+MIPSEND，
+    // 每条的期限由 AT 层自己定，所以上传大 body 的调用方不能靠这一个
+    // SetTimeout() 兜住全部时间。
     http->SetTimeout(std::chrono::seconds{10});
     http->SetFollowRedirects(true);
 

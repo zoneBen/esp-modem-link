@@ -41,6 +41,12 @@ class HttpClient {
   // measuring it first and declaring the total in Content-Length. Off by
   // default.
   //
+  //   SetChunkedUpload(true)
+  //   Open("POST", url)      // head only; returns without waiting
+  //   Write(buf, n) xN       // one chunk per call
+  //   EndBody()              // terminator, then the response head
+  //   GetStatusCode() / Read() xN / Close()
+  //
   // Set before Open(). With it on, Open() returns as soon as the request head
   // has gone out, because a server does not answer a request whose body it has
   // not finished reading - waiting for the head there would wait out the
@@ -50,16 +56,24 @@ class HttpClient {
   // GetStatusCode() and GetResponseHeader() are valid, and Read() drains the
   // body.
   //
+  // The two are mutually exclusive and the engine says so rather than picking
+  // one: a body left over from SetBody() and a body arriving through Write()
+  // cannot both be this request's, and the head would carry a length that the
+  // chunks then contradict. SetBody("") is how a caller clears the pair, so a
+  // client reused for both kinds of request goes SetBody(""), then this.
+  //
   // Two consequences worth knowing before reaching for this. A redirect cannot
   // be followed, because the body that would have to be sent again has already
   // been streamed, so the response is reported rather than chased. And a
   // HTTP/1.0 server does not understand the framing at all; it will usually
   // answer 4xx, or say nothing until EndBody() times out.
   //
-  // Not every engine can honour this. One that leaves HTTP to the module's
-  // firmware has whatever upload behaviour that firmware has, and its Write()
-  // reports NotSupported rather than sending a request whose declared length
-  // disagrees with what follows it.
+  // Not every engine can honour this, and the default is a no-op because the
+  // setter has no way to refuse. One that leaves HTTP to the module's firmware
+  // has whatever upload behaviour that firmware has, and its Write() reports
+  // NotSupported rather than sending a request whose declared length disagrees
+  // with what follows it. The upload cannot then be reported as complete
+  // either: EndBody() below has no default that succeeds.
   virtual void SetChunkedUpload(bool enable) { (void)enable; }
 
   // Ends a chunked request body: sends the terminating zero-length chunk, so
