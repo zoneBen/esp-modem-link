@@ -1,5 +1,6 @@
 #include "at_parser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <sstream>
@@ -121,6 +122,18 @@ std::string EncodeHex(std::string_view data) {
     out.push_back(kDigits[byte >> 4]);
     out.push_back(kDigits[byte & 0x0f]);
   }
+  return out;
+}
+
+std::string ToHexString(uint64_t value) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  if (value == 0) return "0";
+  std::string out;
+  while (value > 0) {
+    out.push_back(kDigits[value & 0x0f]);
+    value >>= 4;
+  }
+  std::reverse(out.begin(), out.end());
   return out;
 }
 

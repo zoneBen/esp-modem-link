@@ -34,6 +34,13 @@ std::vector<uint8_t> ParseHex(std::string_view hex);
 // after a ">" prompt, so the bytes have to be text-safe before they go out.
 std::string EncodeHex(std::string_view data);
 
+// Render an unsigned value as lowercase hex with no leading zeros and no "0x".
+// Not EncodeHex: that renders the bytes of a value, so 10 would come back as
+// "0a" - the two-digit-per-byte form a payload needs. This is the number form,
+// which is what a chunked body's size line is (RFC 9112 section 7.1), where 10
+// is "a". Zero renders as "0", the one case where a single digit is right.
+std::string ToHexString(uint64_t value);
+
 std::vector<int> ParseIntList(std::string_view line);
 
 }  // namespace esp_modem_link::at_parser

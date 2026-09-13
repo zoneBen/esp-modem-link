@@ -139,3 +139,35 @@ TEST(AtParserTest, ParseIntListSkipsNonNumeric) {
   EXPECT_EQ(result[0], 1);
   EXPECT_EQ(result[1], 3);
 }
+
+// The size line of a chunked body is a number in hex, which is what separates
+// this from EncodeHex: that renders the bytes of a value, so the same 10 comes
+// back as "0a" from there and "a" from here.
+TEST(AtParserTest, ToHexStringRendersAnIntegerNotItsBytes) {
+  EXPECT_EQ(ToHexString(10), "a");
+  EXPECT_EQ(ToHexString(255), "ff");
+  EXPECT_EQ(ToHexString(4096), "1000");
+}
+
+// Zero is the one value where a single digit is right rather than a leading-zero
+// artefact, and it is the value that has to come out exactly right: it is the
+// terminator of every chunked body.
+TEST(AtParserTest, ToHexStringRendersZeroAsASingleDigit) {
+  EXPECT_EQ(ToHexString(0), "0");
+}
+
+TEST(AtParserTest, ToHexStringHasNoLeadingZeros) {
+  EXPECT_EQ(ToHexString(1), "1");
+  EXPECT_EQ(ToHexString(16), "10");
+  EXPECT_EQ(ToHexString(0x100), "100");
+}
+
+TEST(AtParserTest, ToHexStringUsesLowercase) {
+  EXPECT_EQ(ToHexString(0xabcdef), "abcdef");
+}
+
+// A four-gigabyte chunk is not a thing anyone sends, but the top of the range is
+// where the shift loop would break first if it used a signed type.
+TEST(AtParserTest, ToHexStringHandlesTheTopOfTheRange) {
+  EXPECT_EQ(ToHexString(0xffffffffffffffffULL), "ffffffffffffffff");
+}
