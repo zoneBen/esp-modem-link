@@ -698,7 +698,7 @@ public:
 
     // 响应访问
     virtual std::string_view GetResponse() const = 0;
-    virtual std::vector<std::string_view> GetResponseLines() const = 0;
+    virtual std::vector<std::string> GetResponseLines() const = 0;
 
     // URC 订阅
     using UrcHandler = std::function<void(std::string_view command,
