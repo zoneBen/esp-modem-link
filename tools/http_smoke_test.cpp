@@ -309,6 +309,109 @@ int main(int argc, char** argv) {
     }
   }
 
+  // --- 5c. A body streamed as chunks ---
+  // The proof being looked for is that the server accepted the framing and read
+  // the body. A server that could not parse it answers 400 or 411; one waiting
+  // for a terminator that never came says nothing at all, which surfaces here as
+  // a timeout. So a real status, and specifically not one of those two, is what
+  // says the request was well formed - and the exact status is the host's
+  // business, so it is reported rather than asserted.
+  //
+  // A server is also entitled to answer before the body is finished: this host
+  // answers 302 to a POST to / and closes the socket straight away, which is
+  // measured rather than assumed - see the note below the pieces. Either outcome
+  // exercises the framing, so both are accepted and which one happened is said.
+  //
+  // The body goes out in pieces rather than at once, because one chunk would not
+  // tell a correct size line from a correct-by-luck single frame.
+  std::printf("\nStreaming a chunked POST %s\n", root.c_str());
+  {
+    http.SetKeepAlive(false);
+    http.SetFollowRedirects(false);
+    http.SetHeader("Content-Type", "text/plain");
+    // The body section above left one set, and a measured body and a streamed
+    // one cannot both be the request's - the head would carry a length that the
+    // chunks then contradict. Clearing it is the documented way to say which of
+    // the two this request is.
+    http.SetBody("");
+    http.SetChunkedUpload(true);
+    auto opened = http.Open("POST", root);
+    if (!opened) {
+      Check("a chunked request opens", false, Describe(opened.error()).c_str());
+    } else {
+      bool answered_early = false;
+      bool wrote_all = true;
+      for (const std::string& piece : {std::string("esp-modem"), std::string("-"),
+                                       std::string("link ") +
+                                           std::string(300, 'x')}) {
+        auto wrote = http.Write(piece.data(), piece.size());
+        if (!wrote) {
+          wrote_all = false;
+          // The server answering mid-body is not the framing's fault, and the
+          // client is expected to stop and say so rather than keep writing into
+          // a socket the server has let go of.
+          answered_early = wrote.error().code == NetworkErrc::kProtocolError;
+          Check("every chunk is accepted", answered_early,
+                Describe(wrote.error()).c_str());
+          if (!answered_early && !http.GetStatusCode().has_value()) {
+            // Measured against www.baidu.com, which answers a POST to / with a
+            // 302 and closes: that answer arrives while AT+MIPSEND is still in
+            // flight, and AtUart folds a line arriving mid-command into that
+            // command's response instead of handing it to the URC handlers. The
+            // 302 is swallowed there, so the module's CME 550 on the next send
+            // is all that is left to report. The framing is not what failed -
+            // the chunk sends either side of the bad one were accepted - but
+            // the upload cannot be finished until a response that arrives in
+            // that window survives it.
+            std::printf(
+                "      note: the host answered before the body was finished and "
+                "the answer never reached the client. A line that arrives while "
+                "an AT command is in flight is absorbed into that command's "
+                "response rather than dispatched as a URC, so the early answer "
+                "is lost and the next send fails on a socket the host has "
+                "already closed. Running this against a host that reads the "
+                "whole body first - httpbin.org, which answers 405 only after "
+                "the terminator - passes.\n");
+          }
+          break;
+        }
+        if (static_cast<size_t>(*wrote) != piece.size()) {
+          wrote_all = false;
+          Check("every chunk is accepted", false, "short write");
+          break;
+        }
+      }
+      if (wrote_all) {
+        Check("every chunk is accepted", true);
+        // Nothing has been answered yet, and cannot be: the server is still
+        // waiting for the body to end. Reading its status here is what shows the
+        // client is not pretending the response has started.
+        Check("no response before the body ends",
+              !http.GetStatusCode().has_value());
+        if (auto ended = http.EndBody(); !ended) {
+          Check("the body ends and the server answers", false,
+                Describe(ended.error()).c_str());
+        }
+      } else if (answered_early) {
+        std::printf("  the server answered before the body was finished\n");
+      }
+
+      auto status = http.GetStatusCode();
+      const int code = status.value_or(0);
+      Check("the server answers a chunked request", status.has_value(),
+            status ? "status " + std::to_string(code)
+                   : Describe(status.error()));
+      Check("the chunked framing is accepted", code != 400 && code != 411,
+            "status " + std::to_string(code));
+      if (code > 0) {
+        std::printf("  answered %d after %s the body\n", code,
+                    answered_early ? "part of" : "all of");
+      }
+      Drain(http);
+    }
+    http.SetChunkedUpload(false);
+  }
+
   // --- 6. TLS through the same engine ---
   // The transport is asked for TLS by the URL, which is the seam the factory
   // exists for; on this module TLS is configured in firmware by the HAL.
