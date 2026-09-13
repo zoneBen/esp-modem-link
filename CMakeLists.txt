@@ -99,14 +99,36 @@ set(ESP_MODEM_LINK_PRIVATE_HEADERS
 
 if(DEFINED IDF_TARGET)
   # ESP-IDF component mode
+  #
+  # The platform layer is the esp_idf one - the POSIX implementations below are
+  # host-only, and the component build never reaches them. Each file covers one
+  # interface in src/platform: the clock, tasks, event groups, the generator
+  # behind RandomUint32, and the UART. The remaining interfaces (timer, GPIO,
+  # queue, serial port) have no ESP-IDF implementation because nothing in the
+  # library reaches them on this platform: the first three are unused, and
+  # CreateSerialUart belongs to the host tools.
+  set(ESP_MODEM_LINK_PLATFORM_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_time.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_task.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_event_group.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_random.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_uart.cpp
+  )
   idf_component_register(
     SRCS
       ${ESP_MODEM_LINK_PRIVATE_SOURCES}
-      ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf/esp_idf_time.cpp
+      ${ESP_MODEM_LINK_PLATFORM_SOURCES}
     INCLUDE_DIRS include
     PRIV_INCLUDE_DIRS src
-    REQUIRES driver
+    # driver: the UART. esp_timer: the clock behind platform::Now, which wants
+    # better resolution than the scheduler tick it would otherwise be built on.
+    REQUIRES driver esp_timer
   )
+  # C++23 is a requirement, not a preference: std::expected carries the error
+  # handling. IDF's own default is gnu++2b on the toolchains new enough to have
+  # it, and saying it here keeps a project that pins an older standard from
+  # compiling this as something it is not.
+  target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_23)
   return()
 endif()
 
