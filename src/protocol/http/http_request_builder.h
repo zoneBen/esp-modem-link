@@ -31,11 +31,17 @@ struct HttpRequestOptions {
   std::string body;
   bool keep_alive = false;
   std::string user_agent = "esp-modem-link/1.0";
+  // The caller streams the body afterwards, so the request declares
+  // Transfer-Encoding: chunked and no length at all. `body` is not sent, and a
+  // caller-supplied Content-Length is dropped rather than forwarded: it would
+  // contradict the framing, and the framing is what the caller asked for.
+  bool chunked_upload = false;
 };
 
 // Renders a complete request, headers and body ready to hand straight to a
 // socket. Content-Length is derived from the body, so a caller cannot send a
-// length that disagrees with what follows it.
+// length that disagrees with what follows it - except under chunked_upload,
+// where there is deliberately no length to disagree with.
 std::string BuildHttpRequest(const ParsedUrl& url,
                              const HttpRequestOptions& options);
 

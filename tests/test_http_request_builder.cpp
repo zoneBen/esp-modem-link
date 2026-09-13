@@ -243,3 +243,82 @@ TEST(BuildHttpRequestTest, EveryHeaderLineUsesCrlf) {
 }
 
 }  // namespace
+
+// The chunked form declares no length at all, which is the whole point: the
+// caller does not know it yet. A request carrying both Content-Length and
+// Transfer-Encoding is malformed, so the absence is as load-bearing as the
+// presence.
+TEST(BuildHttpRequestTest, ChunkedUploadDeclaresNoLength) {
+  HttpRequestOptions options;
+  options.method = "POST";
+  options.chunked_upload = true;
+
+  std::string request = BuildHttpRequest(MustParse("http://example.com/"), options);
+
+  EXPECT_NE(request.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+  EXPECT_EQ(request.find("Content-Length"), std::string::npos);
+}
+
+// A body set on the options is not this mode's: the caller streams it instead,
+// and the head must not carry it or the framing would be contradicted twice
+// over - once by the bytes, once by the length in front of them.
+TEST(BuildHttpRequestTest, ChunkedUploadSendsNoBodyWithTheHead) {
+  HttpRequestOptions options;
+  options.method = "POST";
+  options.body = "not sent from here";
+  options.chunked_upload = true;
+
+  std::string request = BuildHttpRequest(MustParse("http://example.com/"), options);
+
+  auto blank = request.find("\r\n\r\n");
+  ASSERT_NE(blank, std::string::npos);
+  EXPECT_TRUE(request.substr(blank + 4).empty());
+}
+
+// The caller's own Content-Length has to go rather than be forwarded: it was
+// written for a body that is not being sent this way, and a server reading both
+// headers is entitled to reject the request outright.
+TEST(BuildHttpRequestTest, ChunkedUploadDropsACallerSuppliedLength) {
+  HttpRequestOptions options;
+  options.method = "POST";
+  options.headers = {{"Content-Length", "999"}};
+  options.chunked_upload = true;
+
+  std::string request = BuildHttpRequest(MustParse("http://example.com/"), options);
+
+  EXPECT_EQ(request.find("Content-Length"), std::string::npos);
+  EXPECT_NE(request.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+}
+
+// Two Transfer-Encoding fields are as malformed as a length alongside one, so
+// the caller's is replaced rather than appended to.
+TEST(BuildHttpRequestTest, ChunkedUploadReplacesACallerSuppliedEncoding) {
+  HttpRequestOptions options;
+  options.method = "POST";
+  options.headers = {{"Transfer-Encoding", "gzip"}};
+  options.chunked_upload = true;
+
+  std::string request = BuildHttpRequest(MustParse("http://example.com/"), options);
+
+  EXPECT_EQ(request.find("Transfer-Encoding: gzip"), std::string::npos);
+  EXPECT_NE(request.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+  EXPECT_EQ(request.find("Transfer-Encoding"), request.rfind("Transfer-Encoding"));
+}
+
+// Header names are not case-sensitive, and a caller may write them any way at
+// all. Matching only the spelling this file happens to use would leave the
+// lower-case form in place - two Transfer-Encoding fields on the wire, which is
+// exactly what the replacement above exists to prevent.
+TEST(BuildHttpRequestTest, ChunkedUploadRecognisesAHeaderWrittenInAnyCase) {
+  HttpRequestOptions options;
+  options.method = "POST";
+  options.headers = {{"content-length", "999"},
+                     {"transfer-encoding", "gzip"}};
+  options.chunked_upload = true;
+
+  std::string request = BuildHttpRequest(MustParse("http://example.com/"), options);
+
+  EXPECT_EQ(request.find("999"), std::string::npos);
+  EXPECT_EQ(request.find("gzip"), std::string::npos);
+  EXPECT_EQ(request.find("Transfer-Encoding"), request.rfind("Transfer-Encoding"));
+}

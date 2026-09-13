@@ -117,8 +117,30 @@ std::string BuildHttpRequest(const ParsedUrl& url,
   for (const auto& [key, value] : options.headers) {
     set_header(key, value);
   }
-  // Derived from the body, so the two can never disagree.
-  set_header("Content-Length", std::to_string(options.body.size()));
+
+  auto remove_header = [&headers](const std::string& key) {
+    const std::string lowered = ToLower(key);
+    headers.erase(std::remove_if(headers.begin(), headers.end(),
+                                 [&lowered](const auto& header) {
+                                   return ToLower(header.first) == lowered;
+                                 }),
+                  headers.end());
+  };
+
+  if (options.chunked_upload) {
+    // A length the caller supplied has to go even though the body it was
+    // written for is not being sent: a request carrying both a Content-Length
+    // and Transfer-Encoding is malformed, and a server is entitled to reject it
+    // outright. set_header below would not do it, since Content-Length is not
+    // one of the keys being set here.
+    remove_header("Content-Length");
+    // Replaces rather than appends, so a caller that set Transfer-Encoding
+    // itself does not end up with two of them - which is likewise malformed.
+    set_header("Transfer-Encoding", "chunked");
+  } else {
+    // Derived from the body, so the two can never disagree.
+    set_header("Content-Length", std::to_string(options.body.size()));
+  }
 
   std::string request;
   request += options.method;
@@ -132,7 +154,10 @@ std::string BuildHttpRequest(const ParsedUrl& url,
     request += "\r\n";
   }
   request += "\r\n";
-  request += options.body;
+  // Under chunked_upload the body follows from Write(), not from here.
+  if (!options.chunked_upload) {
+    request += options.body;
+  }
   return request;
 }
 
