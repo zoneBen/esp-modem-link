@@ -55,7 +55,15 @@ class Air780eHal : public hal::IModuleHal {
     bool start_reader = true;
   };
 
-  explicit Air780eHal(Options options = {});
+  // Two constructors rather than one with a default argument. "= {}" cannot be
+  // written here: building an Options needs the default member initializer
+  // above, and the standard does not allow a class's default member initializer
+  // to be used in a default argument of the enclosing class - the enclosing
+  // class is not complete yet. MSVC takes it, GCC says "could not convert
+  // '<brace-enclosed initializer list>()'". Defaulting in the .cpp instead puts
+  // the same `{}` where the class *is* complete.
+  Air780eHal();
+  explicit Air780eHal(Options options);
   ~Air780eHal() override;
 
   Air780eHal(const Air780eHal&) = delete;

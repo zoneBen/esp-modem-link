@@ -57,6 +57,8 @@ std::string_view UnfulfillableTlsOption(const TlsConfig& config) {
 
 }  // namespace
 
+Air780eHal::Air780eHal() : Air780eHal(Options{}) {}
+
 Air780eHal::Air780eHal(Options options) : start_reader_(options.start_reader) {}
 
 Air780eHal::~Air780eHal() {
