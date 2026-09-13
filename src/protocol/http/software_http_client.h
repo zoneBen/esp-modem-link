@@ -60,6 +60,7 @@ class SoftwareHttpClient : public HttpClient {
   Result<int> GetStatusCode() override;
   std::string GetResponseHeader(std::string_view key) const override;
   size_t GetContentLength() const override;
+  bool IsChunked() const override;
 
  private:
   // The request as it changes down a redirect chain: the method and body a 303

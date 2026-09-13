@@ -490,4 +490,9 @@ size_t SoftwareHttpClient::GetContentLength() const {
   return parser_.GetContentLength();
 }
 
+bool SoftwareHttpClient::IsChunked() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return parser_.IsChunked();
+}
+
 }  // namespace esp_modem_link::protocol

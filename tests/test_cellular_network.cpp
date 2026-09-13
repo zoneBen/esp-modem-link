@@ -241,6 +241,7 @@ class StubHttpClient : public HttpClient {
     return {};
   }
   size_t GetContentLength() const override { return 0; }
+  bool IsChunked() const override { return false; }
 };
 
 // A module whose firmware HTTP stack does come up.

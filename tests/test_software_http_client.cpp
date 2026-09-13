@@ -429,6 +429,23 @@ TEST(SoftwareHttpClientTest, OpenReturnsOnceHeadersArrive) {
   EXPECT_EQ(*status, 200);
   EXPECT_EQ(test.client().GetResponseHeader("Content-Type"), "text/plain");
   EXPECT_EQ(test.client().GetContentLength(), 5u);
+  EXPECT_FALSE(test.client().IsChunked());
+}
+
+// A chunked response has no Content-Length to give, so the two accessors have
+// to disagree: GetContentLength() reports the zero the header field would have
+// been, and IsChunked() is the one that says there is a body coming anyway. A
+// caller that read only the length would stop at a body it never saw.
+TEST(SoftwareHttpClientTest, ReportsAChunkedBodyAsChunked) {
+  ClientUnderTest test;
+  test.SetResponse(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+      "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n");
+
+  ASSERT_TRUE(test.client().Open("GET", "http://example.com/").has_value());
+
+  EXPECT_TRUE(test.client().IsChunked());
+  EXPECT_EQ(test.client().GetContentLength(), 0u);
 }
 
 TEST(SoftwareHttpClientTest, ReadStreamsTheBody) {

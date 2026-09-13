@@ -48,6 +48,14 @@ class HttpClient {
   virtual Result<int> GetStatusCode() = 0;
   virtual std::string GetResponseHeader(std::string_view key) const = 0;
   virtual size_t GetContentLength() const = 0;
+
+  // Whether the body is chunked, which is what tells a caller reading it
+  // through Read() that GetContentLength() is not the answer: a chunked
+  // response carries no Content-Length, so that returns 0 however much body
+  // follows. Read() decodes the chunk framing either way - this is for a caller
+  // that wants to know how the body is framed, not for one that wants it
+  // decoded.
+  virtual bool IsChunked() const = 0;
 };
 
 }  // namespace esp_modem_link
