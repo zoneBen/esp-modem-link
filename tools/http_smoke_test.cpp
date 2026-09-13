@@ -9,9 +9,14 @@
 // real server accepts, and whether the bytes a real module delivers reassemble
 // into the response the parser expects.
 //
-// The host defaults to example.com, which serves the plain-HTTP checks fine but
-// which this module's TLS stack cannot negotiate with; see the HTTPS check at
-// the end. Pass a host the module can reach over TLS to exercise that path.
+// The host defaults to example.com. The plain-HTTP checks are the ones that host
+// can always serve; the HTTPS check at the end depends on the module rather than
+// on the host, because the ML307R this was written against holds no certificate
+// authority - AT+MSSLCFG="cert" reads back "NULL","NULL","NULL" - so a verified
+// handshake has nothing to check the server against and fails wherever it is
+// pointed. That is why TlsConfig's default asks for no verification, and why the
+// HTTPS section makes its second request with verification asked for
+// explicitly: to show the difference rather than to assume either answer.
 //
 // This tool is also sensitive to a socket left open on the module by an earlier
 // run, which is how the cid-reuse defect was found: the module names only the
@@ -252,19 +257,55 @@ int main(int argc, char** argv) {
   }
 
   // --- 5. A body the client has to send ---
+  // Redirect following is off for this check, because it is not what is under
+  // test and on some hosts it decides the outcome: www.baidu.com answers a POST
+  // to / with "302 Found" and a Location into HTTPS, so a client that follows
+  // ends up testing TLS - and on a module with no certificate authority that hop
+  // fails, which reads as a POST failure that it is not. What is asserted is the
+  // status, so the proof being looked for is that the server parsed the request
+  // and answered at all.
   std::printf("\nExecuting POST %s\n", root.c_str());
   {
     http.SetKeepAlive(false);
+    http.SetFollowRedirects(false);
     http.SetHeader("Content-Type", "text/plain");
     http.SetBody("esp-modem-link");
     auto response = http.Execute("POST", root);
-    // example.com rejects a POST with 405, which still proves the request was
-    // well formed enough for the server to parse and answer.
+    // A host that refuses the method answers 405, which proves the same thing.
     if (!response) {
       Check("POST completes", false, Describe(response.error()).c_str());
     } else {
       Check("POST is answered", response->status_code > 0,
             "status " + std::to_string(response->status_code));
+      const auto location = response->headers.find("location");
+      if (location != response->headers.end()) {
+        std::printf("  answered with a redirect to %s\n",
+                    Elide(location->second, 100).c_str());
+      }
+    }
+  }
+
+  // --- 5b. The other half: that redirect, followed ---
+  // A redirect the engine does follow has to end up on the transport the
+  // Location names, and on this host that transport is HTTPS - so the hop runs
+  // into the same missing certificate authority as the HTTPS check below, and
+  // reaching it from this direction is that same finding rather than a second
+  // one. Every other way of failing here is a real failure, so only that
+  // outcome is reported rather than counted.
+  std::printf("\nExecuting POST %s following redirects\n", root.c_str());
+  {
+    http.SetFollowRedirects(true);
+    auto response = http.Execute("POST", root);
+    if (response) {
+      Check("the redirect is followed", response->status_code > 0,
+            "status " + std::to_string(response->status_code));
+    } else if (response.error().code == NetworkErrc::kTlsHandshakeFailed) {
+      std::printf(
+          "  note: the redirect leads into HTTPS, and the module will not "
+          "perform that handshake: %s\n      see the HTTPS check below\n",
+          Describe(response.error()).c_str());
+    } else {
+      Check("the redirect is followed", false, Describe(response.error()).c_str());
     }
   }
 
@@ -272,26 +313,57 @@ int main(int argc, char** argv) {
   // The transport is asked for TLS by the URL, which is the seam the factory
   // exists for; on this module TLS is configured in firmware by the HAL.
   //
-  // The handshake happens inside AT+MIPOPEN, so a server this firmware cannot
-  // negotiate with fails here and not later. That shows up as the module's own
-  // code in `native` - 753 on ML307R-DL-MBRH0S01 - and it is a property of the
-  // host, not of this engine: example.com returns 753 for every configuration
-  // tried, while hosts with more conservative TLS settings answer 0. Pass a
-  // different host before reading a failure here as an engine defect.
+  // Two requests, because the two halves answer different questions. The first
+  // is the client's default, which asks the module to verify nothing, and it
+  // says whether the transport can carry TLS at all. The second asks for a
+  // checked server, which needs a certificate authority on the module: this
+  // firmware holds none, so AT+MSSLCFG="cert" reads back "NULL","NULL","NULL"
+  // and the handshake fails on every host. A handshake that fails there runs
+  // inside AT+MIPOPEN, so the HAL reports it as a handshake failure with the
+  // module's own code in `native` - 753 against example.com and 762 against
+  // www.baidu.com on ML307R-DL-MBRH0S01. Which codes those are is the HAL's list
+  // to keep; asking it here rather than matching codes again is what stops this
+  // tool from disagreeing with the library about them.
   const std::string secure = "https://" + host + "/";
   std::printf("\nExecuting GET %s\n", secure.c_str());
   {
     auto response = http.Execute("GET", secure);
     if (!response) {
-      std::string detail = Describe(response.error());
-      if (response.error().native == 753) {
-        detail += " - the module's TLS stack could not negotiate with this "
-                  "host; try another one";
-      }
-      Check("HTTPS through the software engine", false, detail);
+      Check("HTTPS through the software engine", false,
+            Describe(response.error()).c_str());
     } else {
       Check("HTTPS returns 200", response->status_code == 200,
             "status " + std::to_string(response->status_code));
+    }
+  }
+
+  // The same request asking for a checked server, which is the half this
+  // hardware cannot do and the reason the default is what it is. Reported rather
+  // than counted when the module refuses: a firmware holding no certificate
+  // authority refusing to verify is the module behaving correctly, and the run
+  // above already proved the transport works. Anything that is not that refusal
+  // is a real failure, so those are still counted.
+  {
+    TlsConfig config;
+    config.verify_certificate = true;
+    config.verify_hostname = true;
+    http.SetTlsConfig(config);
+    std::printf("\nExecuting GET %s asking for verification\n", secure.c_str());
+    auto response = http.Execute("GET", secure);
+    if (response) {
+      Check("HTTPS with verification returns 200", response->status_code == 200,
+            "status " + std::to_string(response->status_code));
+    } else if (response.error().code == NetworkErrc::kTlsHandshakeFailed) {
+      std::printf(
+          "  note: the module will not perform a verified handshake: %s\n"
+          "      AT+MSSLCFG=\"cert\" reads back \"NULL\",\"NULL\",\"NULL\" on "
+          "this firmware, so its SSL context holds no certificate authority to "
+          "check a server against. A TlsConfig that asks for verification "
+          "therefore cannot be honoured here; the connection above succeeded "
+          "because the default asks for none.\n",
+          Describe(response.error()).c_str());
+    } else {
+      Check("HTTPS with verification", false, Describe(response.error()).c_str());
     }
   }
 
