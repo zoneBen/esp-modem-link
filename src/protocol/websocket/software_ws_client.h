@@ -53,9 +53,9 @@ Result<ParsedUrl> ParseWebSocketUrl(std::string_view url);
 // connection that drops and comes back never leaves the application without a
 // heartbeat.
 //
-// OnMessage carries the bytes and nothing else, because DataCallback has no
-// room for a flag: a text message and a binary one arrive the same way here,
-// even though Send() and SendFragment() let a sender say which it is sending.
+// OnMessage carries the message and whether it was sent as binary. The kind is
+// fixed by the frame that opens a message and is remembered until the frame
+// that ends it, since a continuation frame does not carry one.
 class SoftwareWsClient : public WebSocketClient {
  public:
   // The handshake wait is a constructor argument rather than a setter because
@@ -68,19 +68,9 @@ class SoftwareWsClient : public WebSocketClient {
 
   void SetHeader(std::string_view key, std::string_view value) override;
 
-  // An interval of zero - the default - turns the heartbeat off. The timeout is
-  // how long the peer has to answer a PING before the connection is treated as
-  // dead; zero means the interval is used instead, so a caller that names only
-  // an interval still gets a deadline.
-  void SetHeartbeat(std::chrono::seconds interval,
-                    std::chrono::seconds timeout) override;
+  void SetHeartbeat(const HeartbeatConfig& config) override;
 
-  // With reconnection on, a connection that drops or fails its heartbeat is
-  // re-established with a backoff, and OnConnected fires again when it is. The
-  // wait starts at a second and doubles to half a minute; max_retries bounds
-  // how many consecutive attempts are made, and -1 means no bound. Reconnection
-  // is off until this is called.
-  void SetAutoReconnect(bool enable, int max_retries = -1) override;
+  void SetAutoReconnect(const ReconnectConfig& config) override;
 
   // Returns once the upgrade has been accepted and the server's
   // Sec-WebSocket-Accept has been checked against the key that was sent, so a
@@ -174,6 +164,12 @@ class SoftwareWsClient : public WebSocketClient {
   // a backoff that can be half a minute long.
   void WaitInterruptible(std::chrono::milliseconds total);
 
+  // How long to wait before reconnect attempt number `attempt`, counted from
+  // zero. Clamped to max_delay, so a long outage cannot grow the wait without
+  // bound.
+  static std::chrono::milliseconds BackoffFor(const ReconnectConfig& config,
+                                              int attempt);
+
   void ReportError(const NetworkError& error);
 
   WsTransportFactory factory_;
@@ -195,12 +191,16 @@ class SoftwareWsClient : public WebSocketClient {
 
   std::chrono::seconds heartbeat_interval_{0};
   std::chrono::seconds heartbeat_timeout_{0};
-  bool reconnect_enabled_ = false;
-  int max_retries_ = -1;
+  bool heartbeat_enabled_ = false;
+  // Kept whole rather than split into fields so the maintenance loop can take
+  // one copy of the schedule under the lock instead of three.
+  ReconnectConfig reconnect_;
   int reconnect_attempt_ = 0;
   // Set when the retries have run out, so the giving up is reported once rather
-  // than on every tick that follows it.
-  bool reconnect_exhausted_ = false;
+  // than on every tick that follows it. Atomic because the check is made on the
+  // maintenance task while the flag is cleared by whoever asks for a connection
+  // - Connect(), which runs on the caller's thread.
+  std::atomic<bool> reconnect_exhausted_{false};
 
   // Handshake state. handshake_key_ is kept because the accept value the server
   // sends is only checkable against the key that actually went out.
@@ -209,9 +209,18 @@ class SoftwareWsClient : public WebSocketClient {
   std::optional<NetworkError> handshake_error_;
 
   // A message being reassembled from fragments: its kind was fixed by the frame
-  // that started it.
+  // that started it, since the continuation frames that follow carry none.
   bool fragment_open_ = false;
+  bool fragment_binary_ = false;
   std::string fragment_payload_;
+
+  // The same for a message this client is splitting up itself. Deliberately not
+  // the pair above, which counts the peer's frames: one flag for both would let
+  // an outbound fragment make the peer's next complete frame look like a
+  // violation, and let an inbound frame ending a message end the outbound
+  // sequence with it - so the frame after it would be sent as a fresh message
+  // rather than the continuation the peer is waiting for.
+  bool send_fragment_open_ = false;
 
   // True once a close frame has gone out, so the peer's reply is not answered
   // with a second one.

@@ -15,9 +15,6 @@ using EventCallback = std::function<void()>;
 using MessageCallback =
     std::function<void(std::string_view topic, std::string_view payload)>;
 
-using CloseCallback =
-    std::function<void(uint16_t code, std::string_view reason)>;
-
 using PublishAckCallback = std::function<void(int msg_id)>;
 
 }  // namespace esp_modem_link

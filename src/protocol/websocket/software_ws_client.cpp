@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <utility>
 
 #include "platform/random.h"
@@ -27,12 +28,6 @@ constexpr size_t kMaxMessageBytes = 64 * 1024;
 // cellular round trip is the slowest this will meet.
 constexpr std::chrono::milliseconds kCloseWait{2000};
 
-// Reconnection waits a second before the first attempt and doubles from there,
-// which is short enough to come back from a dropped bearer and long enough not
-// to hammer a server that is down.
-constexpr std::chrono::milliseconds kReconnectInitialDelay{1000};
-constexpr std::chrono::milliseconds kReconnectMaxDelay{30000};
-
 // A control frame's payload is a two-byte status code followed by as much of the
 // reason as fits in the 125 bytes a control frame may carry.
 constexpr size_t kMaxCloseReason = kMaxControlPayload - 2;
@@ -48,14 +43,6 @@ std::string ToLower(std::string_view s) {
     return static_cast<char>(std::tolower(c));
   });
   return out;
-}
-
-std::chrono::milliseconds BackoffFor(int attempt) {
-  auto delay = kReconnectInitialDelay;
-  for (int i = 0; i < attempt && delay < kReconnectMaxDelay; ++i) {
-    delay *= 2;
-  }
-  return std::min(delay, kReconnectMaxDelay);
 }
 
 // Trims the reason to what a close frame can hold. The cut backs off to the
@@ -147,19 +134,49 @@ void SoftwareWsClient::SetHeader(std::string_view key, std::string_view value) {
   headers_.emplace_back(std::string(key), std::string(value));
 }
 
-void SoftwareWsClient::SetHeartbeat(std::chrono::seconds interval,
-                                    std::chrono::seconds timeout) {
+void SoftwareWsClient::SetHeartbeat(const HeartbeatConfig& config) {
   std::lock_guard<std::mutex> lock(mutex_);
-  heartbeat_interval_ = interval;
-  heartbeat_timeout_ = timeout;
+  heartbeat_interval_ = config.interval;
+  heartbeat_timeout_ = config.timeout;
+  heartbeat_enabled_ = config.enabled;
 }
 
-void SoftwareWsClient::SetAutoReconnect(bool enable, int max_retries) {
+void SoftwareWsClient::SetAutoReconnect(const ReconnectConfig& config) {
   std::lock_guard<std::mutex> lock(mutex_);
-  reconnect_enabled_ = enable;
-  max_retries_ = max_retries;
+  reconnect_ = config;
   reconnect_attempt_ = 0;
   reconnect_exhausted_ = false;
+}
+
+std::chrono::milliseconds SoftwareWsClient::BackoffFor(
+    const ReconnectConfig& config, int attempt) {
+  // The arithmetic is in double because backoff_factor is one, so the clamp has
+  // to hold on that side too: at the very top of the range a count rounds up to
+  // a double the cast back cannot represent, and the comparison that was meant
+  // to catch it compares equal instead. Half the range still ends the schedule
+  // some 146 million years out, so nothing a caller means is lost by capping
+  // there.
+  constexpr double kMaxDelayMs =
+      static_cast<double>(std::numeric_limits<long long>::max() / 2);
+  const double cap = std::clamp(
+      static_cast<double>(config.max_delay.count()), 0.0, kMaxDelayMs);
+  double delay = std::clamp(
+      static_cast<double>(config.initial_delay.count()), 0.0, cap);
+
+  // A schedule that does not grow must still be a schedule: a factor of one or
+  // less leaves the delay where it started, and a delay of zero stays there, so
+  // the multiplication is skipped rather than run `attempt` times to reach the
+  // same number.
+  const double factor =
+      config.backoff_factor > 1.0f ? static_cast<double>(config.backoff_factor)
+                                   : 1.0;
+  if (factor > 1.0 && delay > 0.0) {
+    for (int i = 0; i < attempt && delay < cap; ++i) {
+      delay *= factor;
+    }
+  }
+  if (delay > cap) delay = cap;
+  return std::chrono::milliseconds(static_cast<long long>(delay));
 }
 
 Result<> SoftwareWsClient::Connect(std::string_view url) {
@@ -213,7 +230,9 @@ Result<> SoftwareWsClient::Establish(std::string_view url) {
     handshake_error_.reset();
     rx_buffer_.clear();
     fragment_open_ = false;
+    fragment_binary_ = false;
     fragment_payload_.clear();
+    send_fragment_open_ = false;
     close_sent_ = false;
     state_ = State::kHandshaking;
   }
@@ -334,9 +353,9 @@ Result<> SoftwareWsClient::SendFragment(const void* data, size_t len, bool binar
     }
     // A continuation frame carries no kind: which one the message is was fixed
     // by the frame that started it, so `binary` is not consulted here.
-    opcode = fragment_open_ ? WsOpcode::kContinuation
-                            : (binary ? WsOpcode::kBinary : WsOpcode::kText);
-    fragment_open_ = !fin;
+    opcode = send_fragment_open_ ? WsOpcode::kContinuation
+                                 : (binary ? WsOpcode::kBinary : WsOpcode::kText);
+    send_fragment_open_ = !fin;
   }
 
   const std::string payload =
@@ -534,6 +553,7 @@ void SoftwareWsClient::HandleFrame(const WsFrame& frame) {
 void SoftwareWsClient::HandleDataFrame(const WsFrame& frame) {
   std::string message;
   std::string violation;
+  bool binary = false;
   bool too_big = false;
   bool deliver = false;
   {
@@ -554,15 +574,20 @@ void SoftwareWsClient::HandleDataFrame(const WsFrame& frame) {
         message = std::move(fragment_payload_);
         fragment_payload_.clear();
         fragment_open_ = false;
+        // From the frame that opened the message: this one is a continuation
+        // and carries no kind of its own.
+        binary = fragment_binary_;
         deliver = true;
       }
     } else if (frame.fin) {
       message = frame.payload;
+      binary = frame.opcode == WsOpcode::kBinary;
       deliver = true;
     } else {
       // The first frame of a message the caller is splitting up: nothing is
       // delivered until the frame that sets fin arrives.
       fragment_open_ = true;
+      fragment_binary_ = frame.opcode == WsOpcode::kBinary;
       fragment_payload_ = frame.payload;
     }
   }
@@ -576,7 +601,7 @@ void SoftwareWsClient::HandleDataFrame(const WsFrame& frame) {
          too_big ? "message too big" : violation);
     return;
   }
-  if (deliver && on_message_) on_message_(message);
+  if (deliver && on_message_) on_message_(message, binary);
 }
 
 void SoftwareWsClient::HandleControlFrame(const WsFrame& frame) {
@@ -653,7 +678,9 @@ void SoftwareWsClient::Teardown(uint16_t code, std::string_view reason) {
     transport = std::move(transport_);
     rx_buffer_.clear();
     fragment_open_ = false;
+    fragment_binary_ = false;
     fragment_payload_.clear();
+    send_fragment_open_ = false;
     close_sent_ = false;
     ping_sent_ms_ = 0;
   }
@@ -662,7 +689,12 @@ void SoftwareWsClient::Teardown(uint16_t code, std::string_view reason) {
   if (transport) transport->Disconnect();
   if (was_open) {
     connected_ = false;
-    if (on_disconnected_) on_disconnected_(code, reason);
+    // The code is a number off the wire and the peer may send one this enum
+    // does not name, in the range the protocol reserves for applications. The
+    // cast keeps the number rather than folding it onto a member it is not.
+    if (on_disconnected_) {
+      on_disconnected_(static_cast<WebSocketCloseCode>(code), reason);
+    }
   }
 }
 
@@ -706,22 +738,22 @@ void SoftwareWsClient::MaintainLoop() {
     if (!maintain_running_) break;
 
     State state = State::kDisconnected;
-    bool reconnect = false;
     bool user_closed = false;
-    int max_retries = 0;
     int attempt = 0;
     std::chrono::seconds interval{0};
     std::chrono::seconds timeout{0};
+    bool heartbeat_on = false;
+    ReconnectConfig schedule;
     std::string url;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       state = state_;
-      reconnect = reconnect_enabled_;
       user_closed = user_closed_;
-      max_retries = max_retries_;
       attempt = reconnect_attempt_;
       interval = heartbeat_interval_;
       timeout = heartbeat_timeout_;
+      heartbeat_on = heartbeat_enabled_;
+      schedule = reconnect_;
       url = url_;
     }
 
@@ -730,8 +762,9 @@ void SoftwareWsClient::MaintainLoop() {
         std::lock_guard<std::mutex> lock(mutex_);
         reconnect_attempt_ = 0;
       }
-      // An interval of zero is how the heartbeat is turned off.
-      if (interval.count() <= 0) continue;
+      // A zero interval would ping as fast as the loop turns, so it is off
+      // whatever the config says; otherwise the flag is the switch.
+      if (!heartbeat_on || interval.count() <= 0) continue;
 
       const auto seconds_to_ms = [](std::chrono::seconds value) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(value)
@@ -762,13 +795,15 @@ void SoftwareWsClient::MaintainLoop() {
       continue;
     }
 
-    if (state != State::kDisconnected || !reconnect || user_closed) continue;
+    if (state != State::kDisconnected || !schedule.enabled || user_closed) {
+      continue;
+    }
 
-    if (max_retries >= 0 && attempt >= max_retries) {
+    if (schedule.max_retries >= 0 && attempt >= schedule.max_retries) {
       // Reported once. The attempt count is not reset here, so this branch is
       // not entered again until a connection succeeds or the caller asks for
       // one.
-      if (!reconnect_exhausted_) {
+      if (!reconnect_exhausted_.load()) {
         {
           std::lock_guard<std::mutex> lock(mutex_);
           reconnect_exhausted_ = true;
@@ -781,7 +816,7 @@ void SoftwareWsClient::MaintainLoop() {
       continue;
     }
 
-    WaitInterruptible(BackoffFor(attempt));
+    WaitInterruptible(BackoffFor(schedule, attempt));
     if (!maintain_running_) break;
 
     auto established = Establish(url);

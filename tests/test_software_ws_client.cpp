@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "mock_tcp_client.h"
@@ -426,7 +427,7 @@ TEST(SoftwareWsClientTest, KeepsTheFramesThatFollowTheHandshake) {
 
   std::string message;
   test.client().OnMessage(
-      [&message](std::string_view data) { message = std::string(data); });
+      [&message](std::string_view data, bool) { message = std::string(data); });
 
   // The server's frame is unmasked, which is what a server is required to send.
   const std::string greeting = "hello";
@@ -568,7 +569,7 @@ TEST(SoftwareWsClientTest, DeliversAMessageFromTheServer) {
   ClientUnderTest test;
   std::string message;
   test.client().OnMessage(
-      [&message](std::string_view data) { message = std::string(data); });
+      [&message](std::string_view data, bool) { message = std::string(data); });
   test.ConnectAndAccept();
 
   test.transport().Deliver(ServerDataFrame(WsOpcode::kText, "hello"));
@@ -578,7 +579,7 @@ TEST(SoftwareWsClientTest, DeliversAMessageFromTheServer) {
 TEST(SoftwareWsClientTest, DeliversTwoMessagesOutOfOneArrival) {
   ClientUnderTest test;
   std::vector<std::string> messages;
-  test.client().OnMessage([&messages](std::string_view data) {
+  test.client().OnMessage([&messages](std::string_view data, bool) {
     messages.emplace_back(data);
   });
   test.ConnectAndAccept();
@@ -595,7 +596,7 @@ TEST(SoftwareWsClientTest, DeliversTwoMessagesOutOfOneArrival) {
 TEST(SoftwareWsClientTest, DeliversAMessageSplitAcrossArrivals) {
   ClientUnderTest test;
   std::vector<std::string> messages;
-  test.client().OnMessage([&messages](std::string_view data) {
+  test.client().OnMessage([&messages](std::string_view data, bool) {
     messages.emplace_back(data);
   });
   test.ConnectAndAccept();
@@ -612,7 +613,7 @@ TEST(SoftwareWsClientTest, DeliversAMessageSplitAcrossArrivals) {
 TEST(SoftwareWsClientTest, ReassemblesAFragmentedMessage) {
   ClientUnderTest test;
   std::vector<std::string> messages;
-  test.client().OnMessage([&messages](std::string_view data) {
+  test.client().OnMessage([&messages](std::string_view data, bool) {
     messages.emplace_back(data);
   });
   test.ConnectAndAccept();
@@ -630,13 +631,107 @@ TEST(SoftwareWsClientTest, ReassemblesThreeFragments) {
   ClientUnderTest test;
   std::string message;
   test.client().OnMessage(
-      [&message](std::string_view data) { message += std::string(data); });
+      [&message](std::string_view data, bool) { message += std::string(data); });
   test.ConnectAndAccept();
 
   test.transport().Deliver(ServerDataFrame(WsOpcode::kText, "a", false));
   test.transport().Deliver(ServerDataFrame(WsOpcode::kContinuation, "b", false));
   test.transport().Deliver(ServerDataFrame(WsOpcode::kContinuation, "c"));
   EXPECT_EQ(message, "abc");
+}
+
+// A continuation frame carries no kind of its own, so the frame that opened the
+// message is the only place it can come from. A receiver that guessed text
+// would hand a binary payload to an application with no way to tell it from a
+// text one - and Send()/SendFragment() let a sender say which it is sending, so
+// the flag is the other half of something the API already offers.
+//
+// Both kinds are checked on the fragmented path. A reader that hardcoded either
+// answer passes one of these and fails the other, which is the point of running
+// them through the same shape.
+TEST(SoftwareWsClientTest, KeepsTheKindOfAFragmentedMessage) {
+  ClientUnderTest test;
+  std::vector<std::pair<std::string, bool>> messages;
+  test.client().OnMessage([&messages](std::string_view data, bool binary) {
+    messages.emplace_back(std::string(data), binary);
+  });
+  test.ConnectAndAccept();
+
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kBinary, "he", false));
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kContinuation, "llo"));
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kText, "he", false));
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kContinuation, "llo"));
+
+  ASSERT_EQ(messages.size(), 2u);
+  EXPECT_EQ(messages[0].first, "hello");
+  EXPECT_TRUE(messages[0].second);
+  EXPECT_EQ(messages[1].first, "hello");
+  EXPECT_FALSE(messages[1].second);
+}
+
+TEST(SoftwareWsClientTest, ReportsTheKindOfAnUnfragmentedMessage) {
+  ClientUnderTest test;
+  std::vector<std::pair<std::string, bool>> messages;
+  test.client().OnMessage([&messages](std::string_view data, bool binary) {
+    messages.emplace_back(std::string(data), binary);
+  });
+  test.ConnectAndAccept();
+
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kText, "one"));
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kBinary, "two"));
+
+  ASSERT_EQ(messages.size(), 2u);
+  EXPECT_FALSE(messages[0].second);
+  EXPECT_TRUE(messages[1].second);
+}
+
+// Sending in fragments and receiving in fragments are two different messages,
+// and one flag for both would confuse them. The outbound sequence is open here,
+// so a peer's complete frame must still be a complete frame: read against the
+// outbound state it looks like a new message starting inside one, which is a
+// protocol violation the connection would be closed over - the peer's legal
+// traffic answered with a teardown.
+TEST(SoftwareWsClientTest, APeerFrameDoesNotEndAnOutboundFragmentSequence) {
+  ClientUnderTest test;
+  std::vector<std::string> messages;
+  test.client().OnMessage(
+      [&messages](std::string_view data, bool) { messages.emplace_back(data); });
+  test.ConnectAndAccept();
+
+  ASSERT_TRUE(test.client().SendFragment("half", 4, false, false).has_value());
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kText, "hello"));
+
+  ASSERT_EQ(messages.size(), 1u);
+  EXPECT_EQ(messages[0], "hello");
+  EXPECT_TRUE(test.client().IsConnected());
+
+  // And the sequence is still open on the way out, so the frame that ends it is
+  // a continuation rather than a second message.
+  ASSERT_TRUE(test.client().SendFragment(" half", 5, false, true).has_value());
+  auto frames = test.client_frames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0].opcode, WsOpcode::kText);
+  EXPECT_FALSE(frames[0].fin);
+  EXPECT_EQ(frames[1].opcode, WsOpcode::kContinuation);
+  EXPECT_TRUE(frames[1].fin);
+}
+
+// The mirror: an inbound message ending must not close an outbound sequence.
+// The frame after it is a continuation the peer is waiting for, and sending it
+// as a fresh message would put an unterminated message on the wire.
+TEST(SoftwareWsClientTest, AnInboundFragmentDoesNotEndAnOutboundSequence) {
+  ClientUnderTest test;
+  test.ConnectAndAccept();
+
+  ASSERT_TRUE(test.client().SendFragment("half", 4, false, false).has_value());
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kBinary, "he", false));
+  test.transport().Deliver(ServerDataFrame(WsOpcode::kContinuation, "llo"));
+  ASSERT_TRUE(test.client().SendFragment(" half", 5, false, true).has_value());
+
+  auto frames = test.client_frames();
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[1].opcode, WsOpcode::kContinuation);
+  EXPECT_TRUE(test.client().IsConnected());
 }
 
 // A ping is a question, and a client that does not answer it is one the peer
@@ -673,8 +768,8 @@ TEST(SoftwareWsClientTest, RefusesAContinuationWithNothingToContinue) {
   std::atomic<bool> closed{false};
   std::atomic<int> close_code{0};
   test.client().OnError(std::ref(error));
-  test.client().OnDisconnected([&](uint16_t code, std::string_view) {
-    close_code = code;
+  test.client().OnDisconnected([&](WebSocketCloseCode code, std::string_view) {
+    close_code = static_cast<int>(code);
     closed = true;
   });
   test.ConnectAndAccept();
@@ -733,7 +828,9 @@ TEST(SoftwareWsClientTest, RefusesAFragmentedMessagePastTheLimit) {
   std::atomic<int> close_code{0};
   test.client().OnError(std::ref(error));
   test.client().OnDisconnected(
-      [&close_code](uint16_t code, std::string_view) { close_code = code; });
+      [&close_code](WebSocketCloseCode code, std::string_view) {
+        close_code = static_cast<int>(code);
+      });
   test.ConnectAndAccept();
 
   // Two frames of 40 KB each: neither trips the receive buffer on its own, and
@@ -776,8 +873,8 @@ TEST(SoftwareWsClientTest, ReportsADroppedConnectionAsAbnormal) {
   ClientUnderTest test;
   std::atomic<bool> closed{false};
   std::atomic<int> close_code{0};
-  test.client().OnDisconnected([&](uint16_t code, std::string_view) {
-    close_code = code;
+  test.client().OnDisconnected([&](WebSocketCloseCode code, std::string_view) {
+    close_code = static_cast<int>(code);
     closed = true;
   });
   test.ConnectAndAccept();
@@ -796,11 +893,12 @@ TEST(SoftwareWsClientTest, CloseSaysWhyAndReportsThePeersAnswer) {
   std::atomic<bool> closed{false};
   std::atomic<int> close_code{0};
   std::string close_reason;
-  test.client().OnDisconnected([&](uint16_t code, std::string_view reason) {
-    close_code = code;
-    close_reason = std::string(reason);
-    closed = true;
-  });
+  test.client().OnDisconnected(
+      [&](WebSocketCloseCode code, std::string_view reason) {
+        close_code = static_cast<int>(code);
+        close_reason = std::string(reason);
+        closed = true;
+      });
   test.ConnectAndAccept();
 
   // The peer answers, which is what ends the wait inside Close() early. A close
@@ -840,8 +938,8 @@ TEST(SoftwareWsClientTest, CloseReportsTheRequestedCodeWhenThePeerIsSilent) {
   ClientUnderTest test;
   std::atomic<bool> closed{false};
   std::atomic<int> close_code{0};
-  test.client().OnDisconnected([&](uint16_t code, std::string_view) {
-    close_code = code;
+  test.client().OnDisconnected([&](WebSocketCloseCode code, std::string_view) {
+    close_code = static_cast<int>(code);
     closed = true;
   });
   test.ConnectAndAccept();
@@ -857,10 +955,11 @@ TEST(SoftwareWsClientTest, ReportsThePeersCodeWhenThePeerClosesFirst) {
   ClientUnderTest test;
   std::atomic<int> close_code{0};
   std::string close_reason;
-  test.client().OnDisconnected([&](uint16_t code, std::string_view reason) {
-    close_code = code;
-    close_reason = std::string(reason);
-  });
+  test.client().OnDisconnected(
+      [&](WebSocketCloseCode code, std::string_view reason) {
+        close_code = static_cast<int>(code);
+        close_reason = std::string(reason);
+      });
   test.ConnectAndAccept();
 
   test.transport().Deliver(
@@ -883,7 +982,9 @@ TEST(SoftwareWsClientTest, ReadsACloseWithNoStatus) {
   ClientUnderTest test;
   std::atomic<int> close_code{0};
   test.client().OnDisconnected(
-      [&close_code](uint16_t code, std::string_view) { close_code = code; });
+      [&close_code](WebSocketCloseCode code, std::string_view) {
+        close_code = static_cast<int>(code);
+      });
   test.ConnectAndAccept();
 
   test.transport().Deliver(ServerDataFrame(WsOpcode::kClose, ""));
@@ -906,7 +1007,7 @@ TEST(SoftwareWsClientTest, CloseOnAConnectionThatIsNotOpenIsSilent) {
   RecordedError error;
   std::atomic<bool> closed{false};
   test.client().OnDisconnected(
-      [&closed](uint16_t, std::string_view) { closed = true; });
+      [&closed](WebSocketCloseCode, std::string_view) { closed = true; });
   test.client().OnError(std::ref(error));
 
   test.client().Close();
@@ -961,7 +1062,9 @@ TEST(SoftwareWsClientTest, DestructorClosesTheTransport) {
 
 TEST(SoftwareWsClientTest, SendsAPingOnceTheConnectionIsIdle) {
   ClientUnderTest test;
-  test.client().SetHeartbeat(std::chrono::seconds(1), std::chrono::seconds(5));
+  test.client().SetHeartbeat({.interval = std::chrono::seconds(1),
+                              .timeout = std::chrono::seconds(5),
+                              .enabled = true});
   test.ConnectAndAccept();
 
   EXPECT_TRUE(WaitFor([&test]() { return test.saw_frame(WsOpcode::kPing); },
@@ -973,7 +1076,9 @@ TEST(SoftwareWsClientTest, SendsAPingOnceTheConnectionIsIdle) {
 // has waited no time at all yet.
 TEST(SoftwareWsClientTest, DoesNotPingImmediatelyAfterConnecting) {
   ClientUnderTest test;
-  test.client().SetHeartbeat(std::chrono::seconds(2), std::chrono::seconds(5));
+  test.client().SetHeartbeat({.interval = std::chrono::seconds(2),
+                              .timeout = std::chrono::seconds(5),
+                              .enabled = true});
   test.ConnectAndAccept();
 
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
@@ -994,6 +1099,22 @@ TEST(SoftwareWsClientTest, SendsNothingWhenTheHeartbeatIsOff) {
   EXPECT_TRUE(test.client().IsConnected());
 }
 
+// The switch is `enabled`, not a zero interval. A caller who turns the
+// heartbeat off and leaves a perfectly ordinary schedule in the config must get
+// no pings; reading a nonzero interval as "on" would resurrect the heartbeat
+// they had just turned off.
+TEST(SoftwareWsClientTest, SendsNothingWhenTheHeartbeatIsDisabled) {
+  ClientUnderTest test;
+  test.client().SetHeartbeat({.interval = std::chrono::seconds(1),
+                              .timeout = std::chrono::seconds(1),
+                              .enabled = false});
+  test.ConnectAndAccept();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  EXPECT_TRUE(test.client_frames().empty());
+  EXPECT_TRUE(test.client().IsConnected());
+}
+
 // A peer that has stopped answering is not a peer that is quiet: a connection
 // that looks alive but is not is worse than one that is known to be gone, so it
 // is given up on and reported.
@@ -1003,8 +1124,12 @@ TEST(SoftwareWsClientTest, GivesUpWhenAPingIsNotAnswered) {
   std::atomic<int> close_code{0};
   test.client().OnError(std::ref(error));
   test.client().OnDisconnected(
-      [&close_code](uint16_t code, std::string_view) { close_code = code; });
-  test.client().SetHeartbeat(std::chrono::seconds(1), std::chrono::seconds(1));
+      [&close_code](WebSocketCloseCode code, std::string_view) {
+        close_code = static_cast<int>(code);
+      });
+  test.client().SetHeartbeat({.interval = std::chrono::seconds(1),
+                              .timeout = std::chrono::seconds(1),
+                              .enabled = true});
   test.ConnectAndAccept();
 
   ASSERT_TRUE(
@@ -1019,7 +1144,9 @@ TEST(SoftwareWsClientTest, APongKeepsTheConnectionAlive) {
   ClientUnderTest test;
   RecordedError error;
   test.client().OnError(std::ref(error));
-  test.client().SetHeartbeat(std::chrono::seconds(1), std::chrono::seconds(1));
+  test.client().SetHeartbeat({.interval = std::chrono::seconds(1),
+                              .timeout = std::chrono::seconds(1),
+                              .enabled = true});
   test.ConnectAndAccept();
 
   // Every ping is answered, which is what a working peer does. The test runs
@@ -1050,7 +1177,7 @@ TEST(SoftwareWsClientTest, ReconnectsAfterADroppedConnection) {
   ClientUnderTest test;
   std::atomic<int> connected{0};
   test.client().OnConnected([&connected]() { connected++; });
-  test.client().SetAutoReconnect(true);
+  test.client().SetAutoReconnect({.enabled = true});
   test.ConnectAndAccept();
   ASSERT_EQ(connected.load(), 1);
 
@@ -1063,6 +1190,24 @@ TEST(SoftwareWsClientTest, ReconnectsAfterADroppedConnection) {
   EXPECT_EQ(test.state(1).connect_calls, 1);
 }
 
+// The schedule is the caller's rather than the engine's, and a first wait of
+// zero means the retry goes out at once. The built-in default is a second, so
+// this can only pass if the config was read rather than the old constant kept.
+TEST(SoftwareWsClientTest, ReconnectsOnTheConfiguredSchedule) {
+  ClientUnderTest test;
+  std::atomic<int> connected{0};
+  test.client().OnConnected([&connected]() { connected++; });
+  test.client().SetAutoReconnect(
+      {.enabled = true, .initial_delay = std::chrono::milliseconds(0)});
+  test.ConnectAndAccept();
+
+  test.transport().DeliverClose();
+
+  EXPECT_TRUE(WaitFor([&connected]() { return connected.load() == 2; },
+                      std::chrono::milliseconds(800)));
+  EXPECT_TRUE(test.client().IsConnected());
+}
+
 // The application hears about the drop and then about the new connection, which
 // is the whole of what auto-reconnect has to tell it.
 TEST(SoftwareWsClientTest, ReportsBothEndsOfAReconnection) {
@@ -1071,11 +1216,11 @@ TEST(SoftwareWsClientTest, ReportsBothEndsOfAReconnection) {
   std::atomic<int> disconnects{0};
   std::atomic<int> close_code{0};
   test.client().OnConnected([&connected]() { connected++; });
-  test.client().OnDisconnected([&](uint16_t code, std::string_view) {
-    close_code = code;
+  test.client().OnDisconnected([&](WebSocketCloseCode code, std::string_view) {
+    close_code = static_cast<int>(code);
     disconnects++;
   });
-  test.client().SetAutoReconnect(true);
+  test.client().SetAutoReconnect({.enabled = true});
   test.ConnectAndAccept();
 
   test.transport().DeliverClose();
@@ -1095,7 +1240,7 @@ TEST(SoftwareWsClientTest, GivesUpAfterTheRetriesRunOut) {
   test.client().OnError([&connect_failures](const NetworkError& e) {
     if (e.code == NetworkErrc::kConnectFailed) connect_failures++;
   });
-  test.client().SetAutoReconnect(true, 1);
+  test.client().SetAutoReconnect({.enabled = true, .max_retries = 1});
   test.ConnectAndAccept();
 
   // The first transport works and the ones after it are refused, so the drop
@@ -1123,7 +1268,7 @@ TEST(SoftwareWsClientTest, GivesUpAfterTheRetriesRunOut) {
 // Closing is a decision, and reconnecting after one would be to overrule it.
 TEST(SoftwareWsClientTest, DoesNotReconnectAfterClose) {
   ClientUnderTest test;
-  test.client().SetAutoReconnect(true);
+  test.client().SetAutoReconnect({.enabled = true});
   test.ConnectAndAccept();
 
   test.client().Close();
