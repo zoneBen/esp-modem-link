@@ -1043,6 +1043,76 @@ TEST_F(Ml307HalTest, TcpSendFailsWhenCommandFails) {
   EXPECT_FALSE(result.has_value());
 }
 
+// A server may answer while AT+MIPSEND is still in flight, and AtUart folds a
+// line arriving then into that command's response rather than handing it to the
+// URC handlers. On a command that only sends, that window is exactly where an
+// answer lands - measured against www.baidu.com, whose early 302 to a streamed
+// POST was swallowed that way, leaving only the CME 550 on the next send to
+// report and the response itself lost. So the send reads the traffic URCs back
+// out of its own response, the way OpenOnId already reads "+MIPOPEN" out of its.
+TEST_F(Ml307HalTest, TcpSendDispatchesPayloadAbsorbedIntoItsOwnResponse) {
+  ExpectTcpOpen(channel_, 0);
+  auto id = hal_->TcpConnect("example.com", 80);
+  ASSERT_TRUE(id.has_value());
+
+  std::string received;
+  hal_->SubscribeTcp(
+      0, [&](int, std::string_view data) { received = std::string(data); },
+      nullptr);
+
+  // One response, not a separate injection: the payload arrived inside the
+  // send's own window, so it is a line of that response and nothing else will
+  // ever look at it.
+  channel_.ExpectCommand("AT+MIPSEND").Respond(
+      "+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\nOK\r\n");
+
+  auto result = hal_->TcpSend(id.value(), "hello", 5);
+
+  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
+  EXPECT_EQ(received, "hello");
+}
+
+// The same window carries the peer's close, and losing that one leaves the
+// client reading a socket the module has already finished with.
+TEST_F(Ml307HalTest, TcpSendDispatchesACloseThatArrivedWithIt) {
+  ExpectTcpOpen(channel_, 0);
+  auto id = hal_->TcpConnect("example.com", 80);
+  ASSERT_TRUE(id.has_value());
+
+  bool closed = false;
+  hal_->SubscribeTcp(0, nullptr, [&](int) { closed = true; });
+
+  channel_.ExpectCommand("AT+MIPSEND").Respond("+MIPURC: \"disconn\",0,1\r\nOK\r\n");
+
+  ASSERT_TRUE(hal_->TcpSend(id.value(), "hello", 5).has_value());
+
+  EXPECT_TRUE(closed);
+}
+
+// Read back only after a command that succeeded. A failed one leaves
+// GetResponseLines() holding the previous command's lines - the mock returns
+// before refreshing them, as a real channel does - so dispatching those again
+// would hand the same payload to the client twice.
+TEST_F(Ml307HalTest, AFailedSendDoesNotRedispatchThePreviousResponse) {
+  ExpectTcpOpen(channel_, 0);
+  auto id = hal_->TcpConnect("example.com", 80);
+  ASSERT_TRUE(id.has_value());
+
+  int deliveries = 0;
+  hal_->SubscribeTcp(0, [&](int, std::string_view) { ++deliveries; }, nullptr);
+
+  channel_.ExpectCommand("AT+MIPSEND").Respond(
+      "+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\nOK\r\n");
+  ASSERT_TRUE(hal_->TcpSend(id.value(), "hello", 5).has_value());
+  ASSERT_EQ(deliveries, 1);
+
+  channel_.FailCommand("AT+MIPSEND", AtErrc::kTimeout);
+  auto failed = hal_->TcpSend(id.value(), "again", 5);
+
+  EXPECT_FALSE(failed.has_value());
+  EXPECT_EQ(deliveries, 1);
+}
+
 // Closing a socket we no longer hold is a no-op. The module announces the peer's
 // close by itself and answers "+CME ERROR: 551" if asked to close it again, so a
 // caller tidying up after a disconnect must not see a spurious error.

@@ -855,10 +855,43 @@ Result<int> Ml307Hal::SendHexPayload(int connect_id,
     auto r = channel_->SendCommand(cmd, kLongTimeout);
     if (!r) return std::unexpected(r.error().ToNetworkError());
 
+    // Anything the module delivered while that command was in flight is sitting
+    // in this command's response buffer, and nothing else will ever look at it.
+    DispatchAbsorbedTraffic();
+
     total += chunk;
   }
 
   return static_cast<int>(len);
+}
+
+void Ml307Hal::DispatchAbsorbedTraffic() {
+  // AtUart folds a line that arrives while a command is in flight into that
+  // command's response buffer and never hands it to the URC handlers
+  // (AtUart::ProcessLine), which is deliberate and is what the 'R' marker in a
+  // trace means. On a command that only sends, that window is exactly where a
+  // server's answer lands: it is the whole reason a chunked upload can lose the
+  // response that stopped it, and why www.baidu.com's early 302 became a CME
+  // 550 naming nothing. So the traffic URCs are read back out of the response
+  // and dispatched here, the same way OpenOnId reads "+MIPOPEN" back out of its
+  // own response.
+  //
+  // Only after a command that succeeded. A failed one leaves GetResponseLines()
+  // holding the previous command's lines, and dispatching those a second time
+  // would hand the same payload to the client twice.
+  //
+  // "+MIPOPEN" and "+MIPCLOSE" are not read back here. Both have a rendezvous
+  // that already tolerates either arrival order - OpenOnId reads its own result
+  // out explicitly, and a close is confirmed by AT+MIPSTATE - so dispatching
+  // them from here would only duplicate what those paths do.
+  for (const auto& line : channel_->GetResponseLines()) {
+    if (line.rfind("+MIPURC", 0) == 0) {
+      // Carries "rtcp" (TCP payload), "rudp" (UDP payload) and "disconn".
+      OnMipUrc("+MIPURC", StripKeyPrefix(line));
+    } else if (line.rfind("+MIPRTCP", 0) == 0) {
+      OnMiprtcpUrc("+MIPRTCP", StripKeyPrefix(line));
+    }
+  }
 }
 
 Result<> Ml307Hal::CloseConnection(int connect_id) {

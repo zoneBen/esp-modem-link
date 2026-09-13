@@ -145,6 +145,11 @@ class Ml307Hal : public hal::IModuleHal {
   // free.
   Result<> CloseConnection(int connect_id);
 
+  // Dispatches the traffic URCs that arrived while a command was in flight and
+  // were therefore absorbed into its response buffer instead of reaching the URC
+  // handlers. Called after a send, which is where an inbound answer lands.
+  void DispatchAbsorbedTraffic();
+
   at_channel::IAtChannel* channel_ = nullptr;
 
   // URC handles
