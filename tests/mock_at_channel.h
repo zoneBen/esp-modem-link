@@ -204,15 +204,70 @@ class MockAtChannel : public at_channel::IAtChannel {
     return {};
   }
 
+  // The reply to a command sent this way is an event, not a response line, so
+  // it is scripted with ThenUrc: the mock fires that URC here, synchronously, and
+  // returns. A Respond() queued for the same prefix is not consulted - there is
+  // no response to parse.
+  AtResult SendLine(std::string_view cmd) override {
+    last_command_ = std::string(cmd);
+    sent_commands_.push_back(last_command_);
+
+    if (SilencedByRate()) {
+      return std::unexpected(AtError(AtErrc::kTimeout, last_command_));
+    }
+
+    for (const auto& [prefix, code] : failures_) {
+      if (last_command_.rfind(prefix, 0) == 0) {
+        return std::unexpected(AtError(code, last_command_));
+      }
+    }
+
+    if (auto urc = TakeUrc(last_command_)) {
+      dispatcher_.Dispatch(*urc);
+    }
+    return {};
+  }
+
+  AtResult SendDataAfterPrompt(std::string_view prefix,
+                               const void* data,
+                               size_t len,
+                               std::chrono::milliseconds timeout) override {
+    (void)timeout;
+    last_command_ = std::string(prefix);
+    sent_commands_.push_back(last_command_);
+    sent_data_commands_.emplace_back(
+        std::string(prefix), std::string(static_cast<const char*>(data), len));
+
+    if (SilencedByRate()) {
+      return std::unexpected(AtError(AtErrc::kTimeout, last_command_));
+    }
+
+    // A refusal is modelled as a failed command rather than a response: the real
+    // channel reports it from the response that beat the prompt, and the caller
+    // must not write its payload either way.
+    for (const auto& [failed_prefix, code] : failures_) {
+      if (last_command_.rfind(failed_prefix, 0) == 0) {
+        return std::unexpected(AtError(code, last_command_));
+      }
+    }
+
+    std::string raw = FindResponse(last_command_);
+    last_response_ = raw;
+    parsed_ = at_channel::ParseResponse(raw);
+    if (!parsed_.ok) {
+      return std::unexpected(parsed_.error);
+    }
+
+    if (auto urc = TakeUrc(last_command_)) {
+      dispatcher_.Dispatch(*urc);
+    }
+    return {};
+  }
+
   std::string_view GetResponse() const override { return last_response_; }
 
-  std::vector<std::string_view> GetResponseLines() const override {
-    std::vector<std::string_view> lines;
-    lines.reserve(parsed_.lines.size());
-    for (const auto& line : parsed_.lines) {
-      lines.emplace_back(line);
-    }
-    return lines;
+  std::vector<std::string> GetResponseLines() const override {
+    return parsed_.lines;
   }
 
   UrcHandle SubscribeUrc(std::string_view prefix,

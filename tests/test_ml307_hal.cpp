@@ -891,21 +891,11 @@ TEST_F(Ml307HalTest, TcpConnectMovesOnWhenACidWillNotFree) {
   EXPECT_EQ(result.value(), 1);
 }
 
-// The module does not always put its OK before the result. A line arriving while
-// a command is in flight is absorbed into that command's response buffer and
-// never reaches the URC dispatcher, so a "+MIPOPEN" that beats its own OK has to
-// be read back out of the response - otherwise the connect waits out the full
-// timeout for a socket that is already open. No URC is queued here, so the
-// rendezvous can only be satisfied from the response buffer.
-TEST_F(Ml307HalTest, TcpConnectFindsTheOpenResultInTheResponseBuffer) {
-  channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
-  channel_.ExpectCommand("AT+MIPOPEN").Respond("+MIPOPEN: 0,0\r\nOK\r\n");
-
-  auto result = hal_->TcpConnect("www.baidu.com", 80);
-  ASSERT_TRUE(result.has_value()) << result.error().Message();
-  EXPECT_EQ(result.value(), 0);
-}
-
+// A "+MIPOPEN" that beats its own OK is the normal case, not an edge: the
+// module reports the result asynchronously, and ExpectTcpOpen models it with
+// ThenUrc, which fires the line while the AT+MIPOPEN is still in flight. The
+// rendezvous is fed by the URC handler because AtUart dispatches every
+// completed line as it arrives, mid-command or not.
 TEST_F(Ml307HalTest, TcpConnectAssignsDistinctIds) {
   ExpectTcpOpen(channel_, 0);
   ExpectTcpOpen(channel_, 1);
@@ -1043,75 +1033,16 @@ TEST_F(Ml307HalTest, TcpSendFailsWhenCommandFails) {
   EXPECT_FALSE(result.has_value());
 }
 
-// A server may answer while AT+MIPSEND is still in flight, and AtUart folds a
-// line arriving then into that command's response rather than handing it to the
-// URC handlers. On a command that only sends, that window is exactly where an
-// answer lands - measured against www.baidu.com, whose early 302 to a streamed
-// POST was swallowed that way, leaving only the CME 550 on the next send to
-// report and the response itself lost. So the send reads the traffic URCs back
-// out of its own response, the way OpenOnId already reads "+MIPOPEN" out of its.
-TEST_F(Ml307HalTest, TcpSendDispatchesPayloadAbsorbedIntoItsOwnResponse) {
-  ExpectTcpOpen(channel_, 0);
-  auto id = hal_->TcpConnect("example.com", 80);
-  ASSERT_TRUE(id.has_value());
-
-  std::string received;
-  hal_->SubscribeTcp(
-      0, [&](int, std::string_view data) { received = std::string(data); },
-      nullptr);
-
-  // One response, not a separate injection: the payload arrived inside the
-  // send's own window, so it is a line of that response and nothing else will
-  // ever look at it.
-  channel_.ExpectCommand("AT+MIPSEND").Respond(
-      "+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\nOK\r\n");
-
-  auto result = hal_->TcpSend(id.value(), "hello", 5);
-
-  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
-  EXPECT_EQ(received, "hello");
-}
-
-// The same window carries the peer's close, and losing that one leaves the
-// client reading a socket the module has already finished with.
-TEST_F(Ml307HalTest, TcpSendDispatchesACloseThatArrivedWithIt) {
-  ExpectTcpOpen(channel_, 0);
-  auto id = hal_->TcpConnect("example.com", 80);
-  ASSERT_TRUE(id.has_value());
-
-  bool closed = false;
-  hal_->SubscribeTcp(0, nullptr, [&](int) { closed = true; });
-
-  channel_.ExpectCommand("AT+MIPSEND").Respond("+MIPURC: \"disconn\",0,1\r\nOK\r\n");
-
-  ASSERT_TRUE(hal_->TcpSend(id.value(), "hello", 5).has_value());
-
-  EXPECT_TRUE(closed);
-}
-
-// Read back only after a command that succeeded. A failed one leaves
-// GetResponseLines() holding the previous command's lines - the mock returns
-// before refreshing them, as a real channel does - so dispatching those again
-// would hand the same payload to the client twice.
-TEST_F(Ml307HalTest, AFailedSendDoesNotRedispatchThePreviousResponse) {
-  ExpectTcpOpen(channel_, 0);
-  auto id = hal_->TcpConnect("example.com", 80);
-  ASSERT_TRUE(id.has_value());
-
-  int deliveries = 0;
-  hal_->SubscribeTcp(0, [&](int, std::string_view) { ++deliveries; }, nullptr);
-
-  channel_.ExpectCommand("AT+MIPSEND").Respond(
-      "+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\nOK\r\n");
-  ASSERT_TRUE(hal_->TcpSend(id.value(), "hello", 5).has_value());
-  ASSERT_EQ(deliveries, 1);
-
-  channel_.FailCommand("AT+MIPSEND", AtErrc::kTimeout);
-  auto failed = hal_->TcpSend(id.value(), "again", 5);
-
-  EXPECT_FALSE(failed.has_value());
-  EXPECT_EQ(deliveries, 1);
-}
+// Traffic arriving inside a send's own response window used to be tested here:
+// a payload, the peer's close, and the requirement that a failed send not hand
+// the previous response out a second time. All three depended on AtUart
+// withholding a mid-command line from the URC handlers. It no longer does - the
+// line is dispatched as it arrives, so it reaches the client whether or not a
+// command is in flight, and ML307 has no absorbed traffic left to read back.
+//
+// The guarantees those tests pinned are now properties of the channel rather
+// than of this HAL, and are tested there:
+// AtUartBasicTest.UrcDuringCommandReachesTheHandler.
 
 // Closing a socket we no longer hold is a no-op. The module announces the peer's
 // close by itself and answers "+CME ERROR: 551" if asked to close it again, so a

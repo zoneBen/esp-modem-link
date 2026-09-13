@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -202,6 +203,58 @@ TEST_F(AtUartBasicTest, UrcWhileIdle) {
   at_uart_->UnsubscribeUrc(handle);
 }
 
+// A URC that lands while a command is in flight is delivered, not swallowed.
+//
+// It used to reach nobody. AtUart folded a mid-command line into that command's
+// response buffer and skipped the handlers on account of the command being in
+// progress, so a socket event arriving during a send was never seen - and a
+// client could wait out a timeout for data that had already arrived. Two bugs
+// were archived against that, and ML307 carried two separate workarounds for it.
+//
+// The line still belongs in the response as well: the command's own parsing
+// depends on the buffer's shape. Both have to happen.
+TEST_F(AtUartBasicTest, UrcDuringCommandReachesTheHandler) {
+  std::atomic<bool> command_returned{false};
+  bool urc_seen = false;
+  bool urc_beat_the_command = false;
+  std::string cmd;
+  std::string args;
+
+  auto handle = at_uart_->SubscribeUrc(
+      "+CSQ", [&](std::string_view c, std::string_view a) {
+        urc_seen = true;
+        urc_beat_the_command = !command_returned.load();
+        cmd = std::string(c);
+        args = std::string(a);
+      });
+
+  std::thread cmd_thread([&] {
+    auto result =
+        at_uart_->SendCommand("AT+CGMM", std::chrono::milliseconds(500));
+    EXPECT_TRUE(result.has_value());
+
+    auto lines = at_uart_->GetResponseLines();
+    EXPECT_NE(std::find(lines.begin(), lines.end(), "+CSQ: 31,99"),
+              lines.end())
+        << "the URC must still be part of the command's response";
+
+    command_returned = true;
+  });
+
+  mock_uart_->WaitForTx(10, std::chrono::milliseconds(200));
+  mock_uart_->InjectRx("AT+CGMM\r\n+CSQ: 31,99\r\nML307R-DNLM\r\nOK\r\n");
+  cmd_thread.join();
+
+  EXPECT_TRUE(urc_seen);
+  EXPECT_EQ(cmd, "+CSQ");
+  EXPECT_EQ(args, "31,99");
+  // The point of the test: the handler ran while the command was still in
+  // flight, which is exactly the case that used to skip it.
+  EXPECT_TRUE(urc_beat_the_command);
+
+  at_uart_->UnsubscribeUrc(handle);
+}
+
 TEST_F(AtUartBasicTest, UrcUnsubscribe) {
   int count = 0;
   auto handle = at_uart_->SubscribeUrc(
@@ -337,4 +390,79 @@ TEST_F(AtUartBasicTest, SendCommandWithData) {
   mock_uart_->InjectRx("OK\r\n");
 
   cmd_thread.join();
+}
+
+// The commands that end in an event rather than a response line - "CONNECT OK",
+// "CLOSE OK", "SHUT OK" - have nothing to wait for here. Waiting would also be
+// wrong: the event is matched against a cid by the caller, and only the caller
+// can tell a late one from this one's.
+TEST_F(AtUartBasicTest, SendLineWritesTheCommandAndDoesNotWait) {
+  auto result = at_uart_->SendLine("AT+CIPSTART=0,\"TCP\",\"h\",80");
+  ASSERT_TRUE(result.has_value());
+
+  mock_uart_->WaitForTx(30, std::chrono::milliseconds(200));
+  EXPECT_EQ(mock_uart_->GetTxData(),
+            "AT+CIPSTART=0,\"TCP\",\"h\",80\r\n");
+}
+
+// AIR780E answers AT+CIPSEND with "\r\n> " - a trailing space and no CRLF. Those
+// bytes can never form a complete line, so the prompt has to be recognised in
+// the partial buffer; and because no CRLF follows, the payload goes out before
+// any terminator exists.
+TEST_F(AtUartBasicTest, SendDataAfterPromptWritesThePayloadOnAPromptWithTrailingSpace) {
+  std::thread cmd_thread([&] {
+    auto result = at_uart_->SendDataAfterPrompt(
+        "AT+CIPSEND=0,5", "hello", 5, std::chrono::milliseconds(500));
+    EXPECT_TRUE(result.has_value());
+  });
+
+  mock_uart_->WaitForTx(15, std::chrono::milliseconds(200));
+  mock_uart_->InjectRx("\r\n> ");
+  cmd_thread.join();
+
+  // The command, then the payload, and nothing else: the trailing
+  // acknowledgement is still the caller's to match.
+  EXPECT_EQ(mock_uart_->GetTxData(), "AT+CIPSEND=0,5\r\nhello");
+
+  // And the prompt was consumed rather than left to become a line of the next
+  // response. A "> " line is not blank, so it would survive the blank-line skip
+  // and be parsed as an answer.
+  EXPECT_TRUE(at_uart_->GetResponseLines().empty());
+}
+
+// A refusal arrives instead of a prompt. Two things must happen: the caller
+// hears the module's own reason rather than a timeout it has to guess at, and
+// no payload is written - a module that did not prompt is not collecting bytes,
+// so anything sent now is read as the front of the next command line.
+TEST_F(AtUartBasicTest, SendDataAfterPromptWritesNothingWhenTheModuleRefuses) {
+  std::thread cmd_thread([&] {
+    auto result = at_uart_->SendDataAfterPrompt(
+        "AT+CIPSEND=0,5", "hello", 5, std::chrono::milliseconds(500));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, AtErrc::kCmeError);
+    EXPECT_EQ(result.error().cme, 3);
+  });
+
+  mock_uart_->WaitForTx(15, std::chrono::milliseconds(200));
+  mock_uart_->InjectRx("\r\n+CME ERROR: 3\r\n");
+  cmd_thread.join();
+
+  EXPECT_EQ(mock_uart_->GetTxData(), "AT+CIPSEND=0,5\r\n");
+}
+
+// A prompt belonging to a command that already gave up must not stand in for the
+// next command's prompt. If it did, the wait would report success and write a
+// payload into a module that is not collecting one.
+TEST_F(AtUartBasicTest, AStalePromptDoesNotSatisfyTheNextPayloadWait) {
+  auto first = at_uart_->SendDataAfterPrompt(
+      "AT+CIPSEND=0,1", "x", 1, std::chrono::milliseconds(50));
+  ASSERT_FALSE(first.has_value());
+
+  // The prompt for that command turns up late, with nobody waiting for it.
+  mock_uart_->InjectRx("\r\n> ");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto second = at_uart_->SendDataAfterPrompt(
+      "AT+CIPSEND=0,1", "y", 1, std::chrono::milliseconds(50));
+  EXPECT_FALSE(second.has_value());
 }

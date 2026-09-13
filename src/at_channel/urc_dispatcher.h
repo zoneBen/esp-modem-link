@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -32,6 +33,12 @@ class UrcDispatcher {
 
   std::unordered_map<std::string, std::vector<HandlerEntry>> handlers_;
   UrcHandle next_handle_ = 1;
+
+  // Subscribe and Unsubscribe are called from whichever thread owns the HAL -
+  // the one bringing the module up, or tearing it down. Dispatch runs on the
+  // receive task. Without this the map is mutated while it is being iterated,
+  // which is a data race rather than a crash only by luck.
+  std::mutex mutex_;
 };
 
 }  // namespace esp_modem_link::at_channel

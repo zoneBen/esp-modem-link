@@ -33,8 +33,14 @@ class AtUart : public IAtChannel {
                                std::chrono::milliseconds timeout,
                                std::string_view cmd_suffix) override;
 
+  AtResult SendLine(std::string_view cmd) override;
+  AtResult SendDataAfterPrompt(std::string_view prefix,
+                               const void* data,
+                               size_t len,
+                               std::chrono::milliseconds timeout) override;
+
   std::string_view GetResponse() const override;
-  std::vector<std::string_view> GetResponseLines() const override;
+  std::vector<std::string> GetResponseLines() const override;
 
   UrcHandle SubscribeUrc(std::string_view prefix,
                          UrcHandler handler) override;
@@ -61,6 +67,11 @@ class AtUart : public IAtChannel {
   void ReceiveTask();
   void ProcessLine(std::string_view line);
 
+  // True when the bytes pending at the end of the receive buffer are a data
+  // prompt: ">" followed only by blanks. The module writes it without a line
+  // terminator, so it can never be recognised as a complete line.
+  static bool IsDataPrompt(std::string_view pending);
+
   // Emits one wire line when debug logging is on; a no-op otherwise. Called
   // from both the command thread and the receive task, so it only reads
   // atomics.
@@ -80,6 +91,12 @@ class AtUart : public IAtChannel {
 
   std::mutex command_mutex_;
   std::atomic<bool> command_in_progress_{false};
+
+  // Set by SendDataAfterPrompt before it writes its command, cleared when the
+  // prompt is consumed or that call gives up. Without it, a prompt left over
+  // from a command that timed out would satisfy the next command's wait before
+  // its own prompt had arrived.
+  std::atomic<bool> prompt_armed_{false};
 
   std::atomic<bool> debug_log_{false};
   // Set by the first line logged, so the trace can be read as a timeline from

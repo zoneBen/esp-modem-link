@@ -111,8 +111,9 @@ class Ml307Hal : public hal::IModuleHal {
 
   void OnMipopenUrc(std::string_view command, std::string_view args);
   // Records a "+MIPOPEN: <id>,<code>" result into the open rendezvous. Called
-  // both by the URC handler and, when the line was absorbed into the command's
-  // own response buffer rather than dispatched, by the code that sent it.
+  // from the URC handler only: AtUart dispatches every completed line as it
+  // arrives, including one that lands while a command is in flight, so there is
+  // no second arrival path to cover.
   void RecordOpenResult(std::string_view args);
   void OnMipcloseUrc(std::string_view command, std::string_view args);
   void OnMiprtcpUrc(std::string_view command, std::string_view args);
@@ -144,11 +145,6 @@ class Ml307Hal : public hal::IModuleHal {
   // Shared by TcpClose and UdpClose, which differ only in which pool entry they
   // free.
   Result<> CloseConnection(int connect_id);
-
-  // Dispatches the traffic URCs that arrived while a command was in flight and
-  // were therefore absorbed into its response buffer instead of reaching the URC
-  // handlers. Called after a send, which is where an inbound answer lands.
-  void DispatchAbsorbedTraffic();
 
   at_channel::IAtChannel* channel_ = nullptr;
 

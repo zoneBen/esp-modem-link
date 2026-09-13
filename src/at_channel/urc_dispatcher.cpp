@@ -9,6 +9,7 @@ UrcDispatcher::UrcDispatcher() = default;
 
 UrcDispatcher::UrcHandle UrcDispatcher::Subscribe(std::string_view prefix,
                                                    UrcHandler handler) {
+  std::lock_guard<std::mutex> lock(mutex_);
   UrcHandle handle = next_handle_++;
   std::string prefix_str(prefix);
   handlers_[prefix_str].push_back(
@@ -17,6 +18,7 @@ UrcDispatcher::UrcHandle UrcDispatcher::Subscribe(std::string_view prefix,
 }
 
 void UrcDispatcher::Unsubscribe(UrcHandle handle) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (auto& [prefix, entries] : handlers_) {
     auto it = std::remove_if(
         entries.begin(), entries.end(),
@@ -51,17 +53,30 @@ void UrcDispatcher::Dispatch(std::string_view line) {
     arguments = Trim(line.substr(colon_pos + 1));
   }
 
-  // Try exact command match first, then prefix matches
-  for (auto& [prefix, entries] : handlers_) {
-    if (command.size() >= prefix.size() &&
-        command.substr(0, prefix.size()) ==
-            std::string_view(prefix)) {
-      for (auto& entry : entries) {
-        if (entry.handler) {
-          entry.handler(command, arguments);
+  // Try exact command match first, then prefix matches.
+  //
+  // The handlers are copied out under the lock and invoked without it. Holding
+  // it across the calls would deadlock the moment a handler unsubscribed itself
+  // - which is a normal thing for a handler to do - and would also serialise
+  // every other subscriber behind the slowest one.
+  std::vector<UrcHandler> matches;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [prefix, entries] : handlers_) {
+      if (command.size() >= prefix.size() &&
+          command.substr(0, prefix.size()) ==
+              std::string_view(prefix)) {
+        for (auto& entry : entries) {
+          if (entry.handler) {
+            matches.push_back(entry.handler);
+          }
         }
       }
     }
+  }
+
+  for (auto& handler : matches) {
+    handler(command, arguments);
   }
 }
 
