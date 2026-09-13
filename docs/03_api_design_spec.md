@@ -155,8 +155,14 @@ using CloseCallback = std::function<void(int code, std::string_view reason)>;
 
 ```cpp
 struct TlsConfig {
-    bool verify_certificate = true;
-    bool verify_hostname = true;
+    // 默认不校验：目标模组的证书是模组自己持有的文件（ML307 的
+    // AT+MSSLCFG="cert"），本库没有写入证书的通道，而验证过的
+    // ML307R-DL-MBRH0S01 固件里一份 CA 都没有，auth=1 在任何主机上
+    // 都握手失败。默认加密但不认证，与原 esp-ml307 无条件的行为一致。
+    // 要求校验服务器需要同时置位两个标志——模组只有一条设置同时覆盖
+    // 证书链与主机名，只给一个会被 HAL 显式报错而非替调用方猜。
+    bool verify_certificate = false;
+    bool verify_hostname = false;
     std::string ca_cert;            // PEM 格式 CA 证书
     std::string client_cert;        // PEM 格式客户端证书
     std::string client_key;         // PEM 格式客户端私钥
