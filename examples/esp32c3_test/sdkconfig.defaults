@@ -1,0 +1,7 @@
+# The console stays on UART0 (GPIO20/21). The modem owns UART1 on GPIO4/GPIO5,
+# and the platform layer refuses to take a port another driver already holds -
+# so moving the console would be the wrong fix even if it looked convenient.
+
+# The default 3584 bytes is thin for the protocol layers above the AT channel,
+# and the socket stages block on the network while holding it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

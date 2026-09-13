@@ -2,3 +2,8 @@ dist/
 .component_hash
 .idea
 build/
+# ESP-IDF generates sdkconfig from sdkconfig.defaults on the first build, and
+# rewrites it under menuconfig - it says "DO NOT EDIT" at the top. The defaults
+# file is the source of truth and is tracked; this is output.
+sdkconfig
+sdkconfig.old
