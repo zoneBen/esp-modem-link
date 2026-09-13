@@ -1,8 +1,10 @@
 version: "0.1.0"
 description: "Multi-module AT cellular network library for ESP32"
 url: "https://github.com/zoneBen/esp-modem-link"
+# No uart-uhci here. An earlier draft of this manifest asked for it as the DMA
+# serial layer, but the AT layer ended up on platform::IUart (the ESP-IDF side
+# is driver/uart), nothing in src/ names UHCI, and the repository the entry
+# pointed at answers 404 - so the dependency could only ever fail the build it
+# was part of. Add it back with a real URL if a UHCI transport is ever wanted.
 dependencies:
   idf: ">=5.5"
-  uart-uhci:
-    path: components/uart-uhci
-    git: https://github.com/liuzuan/uart_uhci.git
