@@ -1231,6 +1231,56 @@ TEST_F(Ml307HalTest, UdpDataUrcDoesNotReachTcpCallback) {
   EXPECT_FALSE(tcp_called);
 }
 
+// The shared layer holds payload that arrived for a cid with no route registered
+// for it, and only the HAL can say when that cid has been handed back. The hold
+// has to go with the cid: the module names a cid and nothing else, so a hold left
+// behind by a finished socket cannot be told apart from payload the next client
+// on that cid is waiting for.
+TEST_F(Ml307HalTest, AReleasedCidCarriesNoHeldPayloadIntoTheNextClient) {
+  ExpectTcpOpen(channel_, 0);
+  ASSERT_TRUE(hal_->TcpConnect("example.com", 80).has_value());
+
+  // Payload for a cid nobody has subscribed to yet, so it is held.
+  channel_.InjectUrc("+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\n");
+
+  // The peer closes, which releases the cid.
+  channel_.InjectUrc("+MIPCLOSE: 0\r\n");
+
+  std::string received;
+  bool closed = false;
+  hal_->SubscribeTcp(
+      0, [&](int, std::string_view data) { received = std::string(data); },
+      [&](int) { closed = true; });
+
+  EXPECT_TRUE(received.empty())
+      << "the retired socket's payload was handed to whoever holds the cid now";
+  // The close is still owed to this cid even though the payload is not: it is
+  // what tells a client that subscribed late that there is nothing coming.
+  EXPECT_TRUE(closed) << "the close that ended the socket went with the payload";
+}
+
+// The one path with no release behind it: a URC is acted on for a cid this
+// process does not hold, so payload can be held for a cid that is free. The
+// module names a cid and nothing else, so that hold would be inherited by the
+// next socket to land there and its client would read bytes belonging to a
+// socket it never opened. Taking a cid is what has to clear it.
+TEST_F(Ml307HalTest, AHoldForAFreeCidIsNotInheritedByTheNextSocket) {
+  channel_.InjectUrc("+MIPURC: \"rtcp\",0,5,\"68656c6c6f\"\r\n");
+
+  ExpectTcpOpen(channel_, 0);
+  auto id = hal_->TcpConnect("example.com", 80);
+  ASSERT_TRUE(id.has_value()) << "error: " << id.error().context;
+  ASSERT_EQ(*id, 0);
+
+  std::string received;
+  hal_->SubscribeTcp(
+      0, [&](int, std::string_view data) { received = std::string(data); },
+      nullptr);
+
+  EXPECT_TRUE(received.empty())
+      << "payload for a socket this process never opened was delivered to one it did";
+}
+
 TEST_F(Ml307HalTest, TcpCloseUrcReleasesSlotAndNotifies) {
   ExpectTcpOpen(channel_, 0);
   auto id = hal_->TcpConnect("example.com", 80);

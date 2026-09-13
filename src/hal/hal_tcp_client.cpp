@@ -30,16 +30,36 @@ Result<> HalTcpClient::Connect(std::string_view host, uint16_t port) {
     return std::unexpected(result.error());
   }
 
-  connect_id_ = result.value();
+  const int connect_id = result.value();
+  connect_id_ = connect_id;
   connected_ = true;
+  const uint32_t my_generation = ++generation_;
 
   // Inbound payload and peer closes arrive unsolicited, so the HAL needs a route
   // back to this client's user callbacks. The subscription is per connection, so
   // several clients share the HAL without seeing each other's traffic.
-  subscription_ = hal_.SubscribeTcp(
+  //
+  // A peer that sent or closed in the instant between the socket opening and this
+  // call has its events held by the HAL and delivered from inside here, so the two
+  // fields above are set before the route exists - which is what lets a close that
+  // arrives that early leave this object disconnected rather than wrongly
+  // connected. The close is also the reason this must stay the last thing Connect
+  // does: nothing after it may assume the connection is still open.
+  const HalSubscription handle = hal_.SubscribeTcp(
       connect_id_,
       [this](int id, std::string_view data) { OnTcpData(id, data); },
       [this](int id) { OnTcpClose(id); });
+
+  // Registering the route is the call that delivers those events, and the
+  // delivery is the user's own callback - which may have reconnected from there.
+  // A nested Connect has taken the object over by now, so its handle is the one
+  // that must survive: assigning this call's handle would overwrite the route the
+  // live connection is using with the dead one it replaced, and neither
+  // Disconnect() nor the destructor could then withdraw the route the callbacks
+  // still point through.
+  if (generation_ == my_generation) {
+    subscription_ = handle;
+  }
 
   return {};
 }

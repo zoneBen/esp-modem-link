@@ -471,50 +471,72 @@ void Ml307Hal::UnregisterUrcHandlers() {
 }
 
 int Ml307Hal::AllocateConnectionId(int first) {
-  // Prefer a cid whose previous occupant has had time to finish announcing its
-  // departure; see ConnectionSlot for why that matters.
-  std::lock_guard<std::mutex> lock(pool_mutex_);
+  int chosen = -1;
+  {
+    // Prefer a cid whose previous occupant has had time to finish announcing its
+    // departure; see ConnectionSlot for why that matters.
+    std::lock_guard<std::mutex> lock(pool_mutex_);
 
-  int oldest = -1;
-  std::chrono::steady_clock::time_point oldest_at{};
+    int oldest = -1;
+    std::chrono::steady_clock::time_point oldest_at{};
 
-  for (int i = first; i < kMaxConnections; i++) {
-    auto& slot = slots_[i];
-    if (slot.used) continue;
+    for (int i = first; i < kMaxConnections; i++) {
+      auto& slot = slots_[i];
+      if (slot.used) continue;
 
-    if (!slot.released ||
-        std::chrono::steady_clock::now() - slot.released_at >= kCidQuarantine) {
-      slot.used = true;
-      return i;
+      if (!slot.released ||
+          std::chrono::steady_clock::now() - slot.released_at >= kCidQuarantine) {
+        slot.used = true;
+        chosen = i;
+        break;
+      }
+
+      if (oldest < 0 || slot.released_at < oldest_at) {
+        oldest = i;
+        oldest_at = slot.released_at;
+      }
     }
 
-    if (oldest < 0 || slot.released_at < oldest_at) {
-      oldest = i;
-      oldest_at = slot.released_at;
+    // Every free cid is still settling. Availability wins over a pristine cid:
+    // refusing to connect would be worse than a small chance of inheriting a
+    // teardown, and the oldest release is the least likely to still be talking.
+    if (chosen < 0 && oldest >= 0) {
+      slots_[oldest].used = true;
+      chosen = oldest;
     }
   }
 
-  // Every free cid is still settling. Availability wins over a pristine cid:
-  // refusing to connect would be worse than a small chance of inheriting a
-  // teardown, and the oldest release is the least likely to still be talking.
-  if (oldest >= 0) {
-    slots_[oldest].used = true;
-    return oldest;
-  }
-  return -1;
+  // The cid is changing hands, so nothing held for the generation that had it
+  // before can be handed to the one taking it. Releasing a cid already voids its
+  // hold; doing it here too makes that a property of the pool rather than of
+  // every path that lets a cid go, and covers the one case with no release behind
+  // it - which this module does reach: AT+MIPCLOSE is acted on for a cid the
+  // process does not hold, so a close can be recorded against a free cid and
+  // would otherwise end the next socket to land on it.
+  if (chosen >= 0) DiscardUndelivered(chosen);
+  return chosen;
 }
 
 void Ml307Hal::ReleaseConnectionId(int id) {
   if (id < 0 || id >= kMaxConnections) return;
 
-  // Held under the same lock as the allocation: the slot is written from the URC
-  // thread and read from the caller's thread, and a reader that saw the "free"
-  // flag without the release time would take a cid the quarantine exists to keep
-  // out of circulation.
-  std::lock_guard<std::mutex> lock(pool_mutex_);
-  slots_[id].used = false;
-  slots_[id].released = true;
-  slots_[id].released_at = std::chrono::steady_clock::now();
+  {
+    // Held under the same lock as the allocation: the slot is written from the URC
+    // thread and read from the caller's thread, and a reader that saw the "free"
+    // flag without the release time would take a cid the quarantine exists to keep
+    // out of circulation.
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    slots_[id].used = false;
+    slots_[id].released = true;
+    slots_[id].released_at = std::chrono::steady_clock::now();
+  }
+
+  // Payload the module handed over for this cid while no route was registered for
+  // it goes with the cid, exactly as the quarantine takes the cid itself out of
+  // circulation: a cid cannot tell two of its generations apart, so a hold that
+  // outlived one would be handed to the next client on this cid as if the previous
+  // socket's bytes were its own.
+  DiscardUndelivered(id);
 }
 
 bool Ml307Hal::IsConnectionUsed(int id) {
@@ -916,7 +938,7 @@ void Ml307Hal::OnMipcloseUrc(std::string_view /*command*/,
   auto fields = SplitCsv(args);
   if (fields.empty()) return;
 
-  auto id = ParseInt(fields[0]);
+  auto id = ParseCid(fields[0]);
   if (!id) return;
 
   ReleaseConnectionId(*id);
@@ -929,7 +951,7 @@ void Ml307Hal::OnMiprtcpUrc(std::string_view /*command*/,
   auto fields = SplitCsv(args);
   if (fields.size() < 3) return;
 
-  auto id = ParseInt(fields[0]);
+  auto id = ParseCid(fields[0]);
   auto len = ParseInt(fields[1]);
   if (!id || !len) return;
 
@@ -953,7 +975,7 @@ void Ml307Hal::OnMipUrc(std::string_view /*command*/, std::string_view args) {
   if (fields.size() < 2) return;
 
   auto event = StripQuotes(fields[0]);
-  auto id = ParseInt(fields[1]);
+  auto id = ParseCid(fields[1]);
   if (!id) return;
 
   if (event == "rtcp") {

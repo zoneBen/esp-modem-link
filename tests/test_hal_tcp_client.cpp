@@ -115,6 +115,11 @@ class MockHal : public IModuleHal {
   }
   void EmitTcpClose(int connect_id) { DispatchTcpClose(connect_id); }
 
+  // What a real HAL does when it gives a cid back to its pool. The mock's pool is
+  // the test's - cids come from SetNextConnectId - so the test is what says when a
+  // cid has been released.
+  void ReleaseCid(int connect_id) { DiscardUndelivered(connect_id); }
+
   // Last call records
   std::string last_host;
   uint16_t last_port = 0;
@@ -281,9 +286,10 @@ TEST(HalTcpClientTest, GetSendBufferFreeReturnsMax) {
   EXPECT_EQ(client.GetSendBufferFree(), SIZE_MAX);
 }
 
-// Everything below exercises the unsolicited half of the client. A payload that
-// the HAL decodes but no route was registered for is silently dropped, so these
-// assert delivery end to end rather than that a subscription call did not crash.
+// Everything below exercises the unsolicited half of the client. What a HAL
+// decodes goes to the route registered for that cid, or - when there is none yet
+// - is held for the route that is about to be registered, so these assert
+// delivery end to end rather than that a subscription call did not crash.
 
 TEST(HalTcpClientTest, InboundDataReachesOnData) {
   MockHal hal;
@@ -474,6 +480,170 @@ TEST(HalTcpClientTest, ADestroyedClientStopsReceiving) {
   hal.EmitTcpData(0, "hello");
 
   EXPECT_EQ(observed, 1);
+}
+
+// The client subscribes after TcpConnect returns, so the events a peer sends in
+// the instant the socket opens have nowhere to go. They are held and handed over
+// by the subscription instead of being dropped, which is the difference between a
+// short response arriving whole and a client reporting a connection lost on a
+// request that in fact succeeded.
+TEST(HalTcpClientTest, PayloadFromBeforeTheSubscriptionIsDelivered) {
+  MockHal hal;
+  HalTcpClient client(hal);
+
+  std::string received;
+  client.OnData([&](std::string_view data) { received = std::string(data); });
+
+  // The peer answered while TcpConnect was still running - i.e. before this
+  // object had a route registered for its cid.
+  hal.EmitTcpData(0, "HTTP/1.1 200 OK");
+
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+
+  EXPECT_EQ(received, "HTTP/1.1 200 OK");
+  EXPECT_TRUE(client.IsConnected());
+}
+
+// The other half of the same window, and the one that used to leave the client
+// stuck: a peer that closes immediately. The connect succeeded and reports
+// success, but the connection is over before the caller can use it, and the
+// object must not claim otherwise.
+TEST(HalTcpClientTest, ACloseFromBeforeTheSubscriptionLeavesTheClientDisconnected) {
+  MockHal hal;
+  HalTcpClient client(hal);
+
+  int closed = 0;
+  client.OnDisconnected([&] { ++closed; });
+
+  hal.EmitTcpClose(0);
+
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+
+  EXPECT_FALSE(client.IsConnected());
+  EXPECT_EQ(closed, 1);
+}
+
+// Both events can be waiting at once, and the order they are handed over in is
+// the order the module produced them: a body followed by an end, never an end
+// followed by payload the client would have no connection to deliver to.
+TEST(HalTcpClientTest, HeldPayloadIsDeliveredBeforeTheHeldClose) {
+  MockHal hal;
+  HalTcpClient client(hal);
+
+  std::string order;
+  client.OnData([&](std::string_view) { order += "data,"; });
+  client.OnDisconnected([&] { order += "close"; });
+
+  hal.EmitTcpData(0, "body");
+  hal.EmitTcpClose(0);
+
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+
+  EXPECT_EQ(order, "data,close");
+  EXPECT_FALSE(client.IsConnected());
+}
+
+// Why a hold has to be voided where the cid is released: a cid names all of its
+// generations equally, so a hold left over from a finished socket would be handed
+// to the next client on that cid as if it were its own, and that client would see
+// bytes it never asked for on a request it just made.
+TEST(HalTcpClientTest, AHoldDoesNotOutliveTheCidItWasHeldFor) {
+  MockHal hal;
+  auto leaving = std::make_unique<HalTcpClient>(hal);
+  ASSERT_TRUE(leaving->Connect("a.example", 80).has_value());
+  hal.EmitTcpClose(0);
+  ASSERT_FALSE(leaving->IsConnected());
+
+  // Payload for the finished socket that nobody will ever claim.
+  hal.EmitTcpData(0, "bytes for the socket that ended");
+
+  // Giving the cid back is what voids it - a released cid is one the pool hands
+  // out again.
+  hal.ReleaseCid(0);
+  leaving.reset();
+
+  hal.SetNextConnectId(0);
+  HalTcpClient replacement(hal);
+  std::string received;
+  replacement.OnData(
+      [&](std::string_view data) { received = std::string(data); });
+  ASSERT_TRUE(replacement.Connect("b.example", 80).has_value());
+  ASSERT_EQ(hal.last_connect_id, 0);
+
+  EXPECT_TRUE(received.empty())
+      << "the previous socket's bytes were handed to the socket that replaced it";
+}
+
+// A hold is bounded, and what it drops on overflow is the tail: TCP is a stream,
+// so losing the oldest bytes would deliver a hole as though the peer had sent it,
+// while a short tail is visible as a stream that stopped early.
+TEST(HalTcpClientTest, AHoldTooLargeForItsBufferEndsTheStreamInsteadOfLying) {
+  MockHal hal;
+  HalTcpClient client(hal);
+
+  size_t received = 0;
+  bool closed = false;
+  client.OnData([&](std::string_view data) { received += data.size(); });
+  client.OnDisconnected([&] { closed = true; });
+
+  // Comfortably past the 4 KiB a hold may carry.
+  const std::string flood(8192, 'x');
+  hal.EmitTcpData(0, flood);
+
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+
+  EXPECT_LT(received, flood.size());
+  EXPECT_EQ(received, 4096u);
+  // The close is what keeps the short prefix from passing for the whole response.
+  EXPECT_TRUE(closed);
+  // And it is a real close, not just a report of one. Nothing ended this socket,
+  // so a close that existed only in the report would leave the module's socket
+  // open with the caller told not to bother closing it - which strands the cid in
+  // the pool for the life of the process.
+  EXPECT_EQ(hal.tcp_close_calls, 1);
+  EXPECT_EQ(hal.last_close_id, 0);
+}
+
+// Connect hands control to the user's callbacks while it is still on the stack,
+// because the delivery of what arrived early happens inside the call that
+// registers the route. A client that reconnects from its own disconnect callback
+// is therefore a nested Connect, and the outer one must not take the object back:
+// it would overwrite the live route's handle with the dead one it replaced,
+// leaving nothing able to withdraw the route the callbacks still point through.
+TEST(HalTcpClientTest, AConnectIssuedFromInsideConnectKeepsItsOwnRoute) {
+  MockHal hal;
+  HalTcpClient client(hal);
+
+  bool reconnected = false;
+  client.OnDisconnected([&] {
+    if (reconnected) return;  // Disconnect() calls this too, and once is enough
+    reconnected = true;
+    // The reconnect a client does when it is told the peer went away.
+    hal.SetNextConnectId(7);
+    EXPECT_TRUE(client.Connect("again.example", 80).has_value());
+  });
+
+  // Already waiting when the first Connect subscribes, so the close lands in the
+  // middle of Connect and the callback runs from there.
+  hal.EmitTcpClose(0);
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+  ASSERT_TRUE(client.IsConnected());
+
+  std::string received;
+  client.OnData([&](std::string_view data) { received = std::string(data); });
+
+  // The object belongs to the nested connect and its route is the live one.
+  hal.EmitTcpData(0, "for the socket that ended");
+  hal.EmitTcpData(7, "for the live one");
+  EXPECT_EQ(received, "for the live one");
+
+  // Withdrawal is the thing that has to reach the live route, so it is what the
+  // two handles are told apart by.
+  client.Disconnect();
+  received.clear();
+  hal.EmitTcpData(7, "after the disconnect");
+  EXPECT_TRUE(received.empty())
+      << "the live route outlived the client that owned it";
 }
 
 }  // namespace

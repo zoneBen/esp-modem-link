@@ -3,11 +3,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "at_channel/iat_channel.h"
+#include "at_parser/at_parser.h"
 #include "hal/imodule_hal.h"
 
 namespace esp_modem_link::modules::ml307 {
@@ -73,6 +76,18 @@ class Ml307Hal : public hal::IModuleHal {
   // Reads a slot's in-use flag under the pool lock. The flag is written from the
   // URC thread, so it cannot be read directly.
   bool IsConnectionUsed(int id);
+
+  // A cid out of a URC, accepted only if this HAL could ever hold it. Everything
+  // downstream keys per-cid state on the value - including the shared layer, which
+  // holds payload for a cid no route names - and module-supplied data is the one
+  // input here that is not the caller's. A cid the pool cannot reach would leave
+  // that state with nothing to prune it: a released cid comes back through the
+  // allocator, and an impossible one never does.
+  static std::optional<int> ParseCid(std::string_view field) {
+    auto id = at_parser::ParseInt(field);
+    if (!id || *id < 0 || *id >= kMaxConnections) return std::nullopt;
+    return id;
+  }
 
   // Allocates a cid, applies the per-socket settings, opens it, and returns the
   // id. Retries past a cid the module has occupied since before this process
