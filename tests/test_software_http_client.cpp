@@ -59,6 +59,9 @@ class ClientUnderTest {
   void SetCloseAfterResponse(bool enable) { script_.close_after = enable; }
   void SetFailConnect(bool enable) { script_.fail_connect = enable; }
   void SetFailSend(bool enable) { script_.fail_send = enable; }
+  // Leaves every send before `index` alone, so a test can reach a Send() that
+  // only a request with a body behind its head has.
+  void SetFailSendAt(size_t index) { script_.fail_send_at = index; }
 
   // One response per connection, in order. The last entry repeats for any
   // supply that runs past the end, so a test ends on a definite answer.
@@ -537,8 +540,10 @@ TEST(SoftwareHttpClientTest, OpenRejectsAnInvalidUrl) {
   EXPECT_EQ(result.error().code, NetworkErrc::kInvalidArgument);
 }
 
-// The request head, Content-Length included, is already on the wire by the time
-// Write() could be called, so appending a body would contradict it.
+// Write() streams a request body, and the head it is streaming into declares
+// no length and says how it is framed instead. That is the contract: the old
+// one rejected Write() outright because a Content-Length was already on the
+// wire, and it stays rejected for a request that did not ask for chunking.
 TEST(SoftwareHttpClientTest, WriteIsRejectedRatherThanSilentlyIgnored) {
   ClientUnderTest test;
   test.SetResponse(kOkResponse);
@@ -547,6 +552,407 @@ TEST(SoftwareHttpClientTest, WriteIsRejectedRatherThanSilentlyIgnored) {
   auto result = test.client().Write("data", 4);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+}
+
+// Opening a chunked upload puts the framing in the head and stops there: a
+// server does not answer a request whose body it has not finished reading, so
+// waiting for a response here would wait out the timeout on every upload.
+TEST(SoftwareHttpClientTest, ChunkedOpenSendsTheHeadAndDoesNotWait) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+
+  ASSERT_TRUE(
+      test.client().Open("POST", "http://example.com/upload").has_value());
+
+  const std::string& head = test.transport().sends.at(0);
+  EXPECT_EQ(head.rfind("POST /upload HTTP/1.1\r\n", 0), 0u);
+  EXPECT_NE(head.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+  EXPECT_EQ(head.find("Content-Length"), std::string::npos);
+  // Nothing to read yet, and that is the point of returning here.
+  EXPECT_EQ(test.client().GetStatusCode().error().code,
+            NetworkErrc::kNotConnected);
+}
+
+// Each Write() is one chunk, and one packet: a size in hex, the bytes, and the
+// CRLF that closes the chunk.
+TEST(SoftwareHttpClientTest, EachChunkIsFramedAsOnePacket) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+
+  ASSERT_EQ(test.client().Write("hello", 5).value(), 5);
+  ASSERT_EQ(test.client().Write("world", 5).value(), 5);
+
+  const auto& sends = test.transport().sends;
+  ASSERT_EQ(sends.size(), 3u);
+  EXPECT_EQ(sends.at(1), "5\r\nhello\r\n");
+  EXPECT_EQ(sends.at(2), "5\r\nworld\r\n");
+}
+
+// The size line is a hex number, not the decimal one, and it is not padded: a
+// chunk of 26 bytes says "1a".
+TEST(SoftwareHttpClientTest, AChunkSizeIsWrittenInHex) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+
+  const std::string payload(26, 'x');
+  ASSERT_EQ(test.client().Write(payload.data(), payload.size()).value(), 26);
+
+  EXPECT_EQ(test.transport().sends.at(1), "1a\r\n" + payload + "\r\n");
+}
+
+// A zero-length piece is legal input and must send nothing at all: a
+// zero-length chunk *is* the terminator, so writing one here would end the body
+// early and leave EndBody() sending a terminator into the response.
+TEST(SoftwareHttpClientTest, WritingNothingSendsNothing) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  const int before = test.transport().send_count.load();
+
+  auto result = test.client().Write("", 0);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, 0);
+  EXPECT_EQ(test.transport().send_count.load(), before);
+}
+
+// A server is entitled to answer before the body is finished - a 302 to a POST,
+// a 401, a 413 - and one that has answered stops reading. Writing further either
+// fills a socket nobody is draining or, measured against www.baidu.com, reaches
+// for one the peer has already closed: there the module answers the next
+// AT+MIPSEND with "CME ERROR: 550", and the 302 that was already in the parser
+// is lost behind a transport error that names nothing useful. So the write is
+// refused with the status in hand instead, and the caller reads what stopped it.
+TEST(SoftwareHttpClientTest, AServerThatAnswersMidBodyStopsTheUpload) {
+  ClientUnderTest test;
+  // The response lands on the second Send, which is the first chunk: the head
+  // went out, and the server answered without waiting for the rest of the body.
+  test.SetResponseSequence({"", RedirectTo(302, "https://other.example/")});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+  const int after_first_chunk = test.transport().send_count.load();
+
+  auto refused = test.client().Write("world", 5);
+
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().code, NetworkErrc::kProtocolError);
+  EXPECT_EQ(refused.error().native, 302);
+  // Nothing further went out, and the answer that stopped the upload is there
+  // to be read rather than swallowed.
+  EXPECT_EQ(test.transport().send_count.load(), after_first_chunk);
+  EXPECT_EQ(*test.client().GetStatusCode(), 302);
+}
+
+// EndBody() closes the body with the terminating chunk. The response that
+// follows is staged on the fourth Send, which is where a real server puts it -
+// so this also pins the number of packets the whole upload takes.
+TEST(SoftwareHttpClientTest, EndBodyTerminatesTheBodyAndCollectsTheResponse) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", "", kOkResponse});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+  ASSERT_TRUE(test.client().Write("world", 5).has_value());
+
+  auto ended = test.client().EndBody();
+
+  ASSERT_TRUE(ended.has_value()) << ended.error().Message();
+  EXPECT_EQ(test.transport().sends.size(), 4u);
+  EXPECT_EQ(test.transport().sends.at(3), "0\r\n\r\n");
+  // EndBody() waits for the head, so everything the caller does next is exactly
+  // what it does after a plain Open().
+  EXPECT_EQ(*test.client().GetStatusCode(), 200);
+  auto body = Drain(test.client());
+  ASSERT_TRUE(body.has_value()) << body.error().Message();
+  EXPECT_EQ(*body, "hello");
+}
+
+// The terminator goes out once. A second one would be read by the server as the
+// size line of the next request.
+TEST(SoftwareHttpClientTest, EndingTheBodyTwiceIsRejected) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", kOkResponse});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+  ASSERT_TRUE(test.client().EndBody().has_value());
+  const int after_first = test.transport().send_count.load();
+
+  auto second = test.client().EndBody();
+
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(second.error().code, NetworkErrc::kInvalidArgument);
+  EXPECT_EQ(test.transport().send_count.load(), after_first);
+}
+
+// Once the body has ended the server is reading the response, so further body
+// bytes would land inside it.
+TEST(SoftwareHttpClientTest, WritingAfterEndBodyIsRejected) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", kOkResponse});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+  ASSERT_TRUE(test.client().EndBody().has_value());
+
+  auto late = test.client().Write("more", 4);
+
+  ASSERT_FALSE(late.has_value());
+  EXPECT_EQ(late.error().code, NetworkErrc::kInvalidArgument);
+}
+
+TEST(SoftwareHttpClientTest, WritingWithoutAnOpenRequestIsRejected) {
+  ClientUnderTest test;
+  test.client().SetChunkedUpload(true);
+
+  auto result = test.client().Write("data", 4);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotConnected);
+}
+
+// After Close() the upload is over, so a Write() that follows is a caller who
+// has lost track of the flow rather than one still sending.
+TEST(SoftwareHttpClientTest, WritingAfterCloseIsRejected) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  test.client().Close();
+
+  auto result = test.client().Write("data", 4);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotConnected);
+}
+
+// A second request cannot be started on a socket that is in the middle of a
+// chunked body. With keep-alive the transport is reused, so the new head would
+// be rendered straight into the open body and the server would read it as the
+// next chunk-size line - while the caller was told the request succeeded.
+TEST(SoftwareHttpClientTest, ASecondRequestCannotStartInsideAnOpenBody) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetKeepAlive(true);
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+
+  auto second = test.client().Open("POST", "http://example.com/other");
+
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(second.error().code, NetworkErrc::kInvalidArgument);
+  // The head and one chunk, and nothing else: the second head never reached the
+  // socket, and no second connection was opened to carry it.
+  EXPECT_EQ(test.transport().sends.size(), 2u);
+  EXPECT_EQ(test.transport_count(), 1u);
+}
+
+// Execute() reaches the socket through the same send, so it has to be refused
+// for the same reason - and its body was read before the upload began, so there
+// is no version of this that could have been sent correctly.
+TEST(SoftwareHttpClientTest, ExecuteCannotStartInsideAnOpenBody) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetKeepAlive(true);
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+
+  auto executed = test.client().Execute("GET", "http://example.com/other");
+
+  ASSERT_FALSE(executed.has_value());
+  EXPECT_EQ(executed.error().code, NetworkErrc::kInvalidArgument);
+  EXPECT_EQ(test.transport().sends.size(), 2u);
+}
+
+// The peer hanging up is known to the client as soon as it happens, so a chunk
+// written afterwards is refused rather than reported as sent into a socket that
+// is already gone.
+TEST(SoftwareHttpClientTest, WritingAfterThePeerHangsUpIsRejected) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.transport().last_client->DeliverClose());
+  const int after_head = test.transport().send_count.load();
+
+  auto result = test.client().Write("data", 4);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotConnected);
+  EXPECT_EQ(test.transport().send_count.load(), after_head);
+}
+
+// EndBody() still sends its terminator - the body may well have reached a peer
+// that answered and left - but a response that never arrives because the peer is
+// gone has to take the socket with it. The request is complete by then, so
+// leaving the socket in place would answer the *next* request with this one's
+// status.
+TEST(SoftwareHttpClientTest, EndingTheBodyAfterThePeerHangsUpLetsTheSocketGo) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.transport().last_client->DeliverClose());
+
+  auto ended = test.client().EndBody();
+
+  ASSERT_FALSE(ended.has_value());
+  EXPECT_EQ(ended.error().code, NetworkErrc::kConnectionLost);
+  EXPECT_EQ(test.transport().disconnect_calls, 1);
+}
+
+// Asking for chunking and then never opening a request is a caller who has lost
+// track of the flow, and the answer says so - it does not name the flag they
+// have already set.
+TEST(SoftwareHttpClientTest, EndingABodyThatWasNeverOpenedIsRejected) {
+  ClientUnderTest test;
+  test.client().SetChunkedUpload(true);
+
+  auto ended = test.client().EndBody();
+
+  ASSERT_FALSE(ended.has_value());
+  EXPECT_EQ(ended.error().code, NetworkErrc::kNotConnected);
+}
+
+// Turning the flag off part way through cannot be allowed to strand the body:
+// the head is on the wire declaring chunks, so the only ways out are the
+// terminator and closing the connection. The latch Open() took is what governs.
+TEST(SoftwareHttpClientTest, TurningChunkingOffMidUploadStillLetsTheBodyEnd) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", "", kOkResponse});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+
+  test.client().SetChunkedUpload(false);
+
+  ASSERT_TRUE(test.client().Write("world", 5).has_value());
+  auto ended = test.client().EndBody();
+  ASSERT_TRUE(ended.has_value()) << ended.error().Message();
+  EXPECT_EQ(test.transport().sends.at(3), "0\r\n\r\n");
+}
+
+// A body measured up front and a body streamed afterwards cannot both be the
+// request's, and guessing which one the caller meant would send a head that
+// disagrees with what follows it.
+TEST(SoftwareHttpClientTest, AChunkedUploadRejectsABodySetInAdvance) {
+  ClientUnderTest test;
+  test.SetResponse(kOkResponse);
+  test.client().SetChunkedUpload(true);
+  test.client().SetBody("already measured");
+
+  auto result = test.client().Open("POST", "http://example.com/");
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kInvalidArgument);
+  EXPECT_EQ(test.transport_count(), 0u);
+}
+
+// The interim "100 Continue" carries neither a length nor a Transfer-Encoding,
+// so it would be read as a body that ends when the peer hangs up - with the
+// real response head inside it.
+TEST(SoftwareHttpClientTest, AChunkedUploadRejectsExpectContinue) {
+  ClientUnderTest test;
+  test.SetResponse(kOkResponse);
+  test.client().SetChunkedUpload(true);
+  test.client().SetHeader("Expect", "100-continue");
+
+  auto result = test.client().Open("POST", "http://example.com/");
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kInvalidArgument);
+  EXPECT_EQ(test.transport_count(), 0u);
+}
+
+// The rejection above has to be recoverable from, or a caller that set a body
+// once can never use a chunked upload on the same client. An empty body is how
+// that is said, and it has to be read as "no body" rather than as a body of
+// length zero - which as a chunked upload is the same thing anyway, but as a
+// Content-Length request would send "Content-Length: 0" where the caller meant
+// to stream.
+TEST(SoftwareHttpClientTest, AnEmptyBodyClearsTheWayForAChunkedUpload) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.client().SetChunkedUpload(true);
+  test.client().SetBody("meant for another request");
+  test.client().SetBody("");
+
+  auto opened = test.client().Open("POST", "http://example.com/");
+
+  ASSERT_TRUE(opened.has_value()) << opened.error().Message();
+  const std::string& head = test.transport().sends.at(0);
+  EXPECT_NE(head.find("Transfer-Encoding: chunked"), std::string::npos);
+  EXPECT_EQ(head.find("Content-Length"), std::string::npos);
+}
+
+// A redirect asks for the request to be sent again somewhere else, and the body
+// has already gone out. Following it is impossible, so it is reported rather
+// than handed back as though it had been followed - and the connection is let
+// go, since the redirect's own body was never read.
+TEST(SoftwareHttpClientTest, AChunkedUploadDoesNotFollowARedirect) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", RedirectTo(307, "http://other.example/")});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+
+  auto ended = test.client().EndBody();
+
+  ASSERT_FALSE(ended.has_value());
+  EXPECT_EQ(ended.error().code, NetworkErrc::kProtocolError);
+  EXPECT_EQ(ended.error().native, 307);
+  // One transport: the redirect was not chased, and the second request was
+  // never built.
+  EXPECT_EQ(test.transport_count(), 1u);
+  // Where the server pointed is still readable, which is what a caller acts on.
+  EXPECT_EQ(test.client().GetResponseHeader("Location"),
+            "http://other.example/");
+}
+
+// A chunk that will not go out leaves the body half-sent, and the request
+// cannot be finished from there - the server is waiting for a terminator that
+// is not coming. The connection goes with it.
+//
+// The send that fails is the chunk's, not the head's: a short write would leave
+// the size line claiming more bytes than the socket carries, and neither the
+// error path nor the short-write path can put the stream back in step, so both
+// end here. The mock cannot produce a short write, so this covers the error.
+TEST(SoftwareHttpClientTest, AChunkThatWillNotSendDropsTheConnection) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.SetFailSendAt(1);  // the head goes out; the first chunk does not
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+
+  auto result = test.client().Write("hello", 5);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kTransmitFailed);
+  EXPECT_EQ(test.transport().disconnect_calls, 1);
+}
+
+// A chunked upload is a streaming request, so it is Close() that gives the
+// connection back, and only once the response has been read.
+TEST(SoftwareHttpClientTest, CloseAfterAChunkedUploadReleasesTheTransport) {
+  ClientUnderTest test;
+  test.SetResponseSequence({"", "", kOkResponse});
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_TRUE(test.client().Write("hello", 5).has_value());
+  ASSERT_TRUE(test.client().EndBody().has_value());
+
+  test.client().Close();
+
+  EXPECT_EQ(test.transport().disconnect_calls, 1u);
 }
 
 TEST(SoftwareHttpClientTest, CloseReleasesTheTransport) {

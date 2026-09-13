@@ -43,6 +43,7 @@ class SoftwareHttpClient : public HttpClient {
   void SetTlsConfig(const TlsConfig& config) override;
   void SetFollowRedirects(bool enable) override;
   void SetMaxRedirects(int max) override;
+  void SetChunkedUpload(bool enable) override;
 
   // Sends the request and buffers the entire response. Returns once the body is
   // complete, so the result owns its data.
@@ -51,10 +52,13 @@ class SoftwareHttpClient : public HttpClient {
 
   // Streams instead of buffering. Open() returns once the response headers have
   // arrived, so GetStatusCode() and GetResponseHeader() are valid from then on,
-  // and Read() then drains the body as it is received.
+  // and Read() then drains the body as it is received. With chunked upload on
+  // there are no response headers to wait for yet - the body has not been sent -
+  // so Open() returns once the request head is out and EndBody() is what waits.
   Result<> Open(std::string_view method, std::string_view url) override;
   Result<int> Read(void* buffer, size_t size) override;
   Result<int> Write(const void* buffer, size_t size) override;
+  Result<> EndBody() override;
   void Close() override;
 
   Result<int> GetStatusCode() override;
@@ -80,11 +84,16 @@ class SoftwareHttpClient : public HttpClient {
   Result<> EnsureConnected(const ParsedUrl& url);
   void DropTransport();
 
-  Result<> StartRequest(const RequestState& request);
+  Result<> StartRequest(const RequestState& request, bool chunked_upload);
 
   // Waits until the response head has arrived and hands back its status and
   // headers.
   Result<HttpResponse> AwaitHeaders();
+
+  // The chunked half of Open(): validates the request, sends the head with
+  // Transfer-Encoding: chunked, and arms the upload. Leaves the response to
+  // EndBody().
+  Result<> BeginChunkedUpload(const RequestState& request);
 
   // One attempt at the request. Execute() owns the decision to try again; this
   // is the whole of the work for a single try.
@@ -121,6 +130,19 @@ class SoftwareHttpClient : public HttpClient {
   bool follow_redirects_ = true;
   int max_redirects_ = kMaxRedirects;
   TlsConfig tls_;
+
+  // The caller's request to stream the body, and the two facts about the upload
+  // actually in flight that decide what a Write() may do with the socket.
+  // chunked_upload_ is read only by Open(), which latches it into
+  // upload_chunked_: turning the flag off midway through an upload must not put
+  // unframed bytes behind a chunked head. upload_active_ is the latch that says
+  // the head has gone out and the terminating chunk has not, which no other
+  // state here can express - without it, Write() after EndBody() appends to a
+  // body the server has stopped reading, and a second EndBody() sends a
+  // zero-length chunk where a request line belongs.
+  bool chunked_upload_ = false;
+  bool upload_chunked_ = false;
+  bool upload_active_ = false;
 
   HttpParser parser_;
 

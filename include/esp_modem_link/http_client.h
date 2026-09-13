@@ -37,6 +37,44 @@ class HttpClient {
   virtual void SetFollowRedirects(bool enable) { (void)enable; }
   virtual void SetMaxRedirects(int max) { (void)max; }
 
+  // Sends the request body in pieces as Write() supplies it, rather than
+  // measuring it first and declaring the total in Content-Length. Off by
+  // default.
+  //
+  // Set before Open(). With it on, Open() returns as soon as the request head
+  // has gone out, because a server does not answer a request whose body it has
+  // not finished reading - waiting for the head there would wait out the
+  // timeout on every upload. Write() then sends each piece as one chunk and
+  // EndBody() ends the body, which is also what waits for the response head.
+  // So everything after EndBody() is exactly what it is after a plain Open():
+  // GetStatusCode() and GetResponseHeader() are valid, and Read() drains the
+  // body.
+  //
+  // Two consequences worth knowing before reaching for this. A redirect cannot
+  // be followed, because the body that would have to be sent again has already
+  // been streamed, so the response is reported rather than chased. And a
+  // HTTP/1.0 server does not understand the framing at all; it will usually
+  // answer 4xx, or say nothing until EndBody() times out.
+  //
+  // Not every engine can honour this. One that leaves HTTP to the module's
+  // firmware has whatever upload behaviour that firmware has, and its Write()
+  // reports NotSupported rather than sending a request whose declared length
+  // disagrees with what follows it.
+  virtual void SetChunkedUpload(bool enable) { (void)enable; }
+
+  // Ends a chunked request body: sends the terminating zero-length chunk, so
+  // the server knows the request is complete, and then waits for the response
+  // head. Without it a Close() abandons the request, which the server sees as
+  // a truncated body.
+  //
+  // Reports NotSupported when SetChunkedUpload(true) has not been set, which is
+  // not a no-op on purpose: a default that succeeded would report an upload
+  // that never happened as complete.
+  virtual Result<> EndBody() {
+    return std::unexpected(NetworkError::NotSupported(
+        "EndBody requires SetChunkedUpload(true) before Open()"));
+  }
+
   virtual Result<HttpResponse> Execute(std::string_view method,
                                        std::string_view url) = 0;
 
@@ -55,6 +93,9 @@ class HttpClient {
   // follows. Read() decodes the chunk framing either way - this is for a caller
   // that wants to know how the body is framed, not for one that wants it
   // decoded.
+  //
+  // This is about the response. It says nothing about how the request body went
+  // out, which is SetChunkedUpload()'s business and is not readable back.
   virtual bool IsChunked() const = 0;
 };
 

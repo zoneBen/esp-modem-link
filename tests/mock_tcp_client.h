@@ -72,6 +72,12 @@ class MockTcpClient : public TcpClient {
     size_t chunk_size = 0;  // 0 = deliver the response in one piece
     bool fail_connect = false;
     bool fail_send = false;
+    // Fail the send at this index (0-based) and every one after it, rather than
+    // all of them. A client that sends a head and then a body has two paths
+    // through the same Send(), and only the second is the one under test - with
+    // fail_send alone the head would fail first and the body never be reached.
+    // SIZE_MAX leaves every send alone.
+    size_t fail_send_at = SIZE_MAX;
   };
 
   MockTcpClient(std::shared_ptr<MockState> state, const Script& script)
@@ -111,8 +117,8 @@ class MockTcpClient : public TcpClient {
     const std::string bytes(static_cast<const char*>(data), len);
     state_->sent.append(bytes);
     state_->sends.push_back(bytes);
-    state_->send_count++;
-    if (script_.fail_send) {
+    const size_t index = static_cast<size_t>(state_->send_count++);
+    if (script_.fail_send || index >= script_.fail_send_at) {
       return std::unexpected(
           NetworkError(NetworkErrc::kTransmitFailed, 0, "mock send failed"));
     }
