@@ -408,6 +408,10 @@ int main(int argc, char** argv) {
                     answered_early ? "part of" : "all of");
       }
       Drain(http);
+      // The upload is over either way, and an upload that ended early leaves a
+      // request the server never finished reading. Closing says so rather than
+      // leaving the socket to the next section.
+      http.Close();
     }
     http.SetChunkedUpload(false);
   }

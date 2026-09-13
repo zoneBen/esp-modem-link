@@ -110,6 +110,13 @@ void SoftwareHttpClient::DropTransport() {
   }
   std::lock_guard<std::mutex> lock(mutex_);
   connected_ = false;
+  // A dropped socket ends any upload that was running on it: the body is not
+  // going anywhere, and a latch left armed would refuse every later request on a
+  // client whose upload is already over. The caller would have to know to call
+  // Close() after a send that failed, which is not something a failure should
+  // require of them.
+  upload_active_ = false;
+  upload_chunked_ = false;
 }
 
 Result<> SoftwareHttpClient::EnsureConnected(const ParsedUrl& url) {
@@ -626,7 +633,8 @@ Result<int> SoftwareHttpClient::Write(const void* buffer, size_t size) {
     if (!upload_active_) {
       return std::unexpected(NetworkError(
           NetworkErrc::kInvalidArgument, 0,
-          "the chunked request body was already ended by EndBody()"));
+          "the chunked request body is no longer being written - it was ended by "
+          "EndBody(), or the server answered before it was finished"));
     }
     // A peer that has hung up is known before the write is attempted, and a
     // chunk reported as sent into a closed socket is worse than a refusal: the
@@ -645,6 +653,11 @@ Result<int> SoftwareHttpClient::Write(const void* buffer, size_t size) {
     // keeps it, and the caller can read the response that stopped them.
     if (parser_.GetState() != HttpParser::State::kStatusLine) {
       const int status = parser_.GetStatusCode();
+      // The upload is over: no more of the body will be written, and the
+      // response is already here, so EndBody() has nothing left to do either.
+      // Left armed, the latch would refuse every later request on this client
+      // until the caller happened to call Close().
+      upload_active_ = false;
       return std::unexpected(NetworkError(
           NetworkErrc::kProtocolError, status,
           "the server answered with status " + std::to_string(status) +
@@ -722,7 +735,8 @@ Result<> SoftwareHttpClient::EndBody() {
     if (!upload_active_) {
       return std::unexpected(NetworkError(
           NetworkErrc::kInvalidArgument, 0,
-          "the chunked request body was already ended by EndBody()"));
+          "the chunked request body is no longer being written - it was ended by "
+          "EndBody(), or the server answered before it was finished"));
     }
     // Cleared before the terminator goes out, not after: if the send fails the
     // upload is finished either way, and a second EndBody() must not put
@@ -780,14 +794,13 @@ Result<> SoftwareHttpClient::EndBody() {
 }
 
 void SoftwareHttpClient::Close() {
+  // DropTransport also clears any upload latch: an abandoned upload leaves a
+  // request head on the wire with no body behind it, so the next Open() must not
+  // believe it is still in progress.
   DropTransport();
   std::lock_guard<std::mutex> lock(mutex_);
   pending_.clear();
   streaming_ = false;
-  // An abandoned upload leaves a request head on the wire with no body behind
-  // it, so the next Open() must not believe it is still in progress.
-  upload_active_ = false;
-  upload_chunked_ = false;
 }
 
 Result<int> SoftwareHttpClient::GetStatusCode() {

@@ -648,6 +648,14 @@ TEST(SoftwareHttpClientTest, AServerThatAnswersMidBodyStopsTheUpload) {
   // to be read rather than swallowed.
   EXPECT_EQ(test.transport().send_count.load(), after_first_chunk);
   EXPECT_EQ(*test.client().GetStatusCode(), 302);
+
+  // The upload ended with it, so there is no body left for EndBody() to finish
+  // and no reason for the next request to be refused: the caller reads the
+  // response, then gets on with something else.
+  EXPECT_FALSE(test.client().EndBody().has_value());
+  test.SetResponse(kOkResponse);
+  auto next = test.client().Open("GET", "http://example.com/");
+  EXPECT_TRUE(next.has_value()) << next.error().Message();
 }
 
 // EndBody() closes the body with the terminating chunk. The response that
@@ -839,6 +847,25 @@ TEST(SoftwareHttpClientTest, TurningChunkingOffMidUploadStillLetsTheBodyEnd) {
   auto ended = test.client().EndBody();
   ASSERT_TRUE(ended.has_value()) << ended.error().Message();
   EXPECT_EQ(test.transport().sends.at(3), "0\r\n\r\n");
+}
+
+// An upload that failed at the transport is over, and the client has to be
+// usable afterwards without the caller knowing to call Close(). The socket is
+// gone, so the body is not going anywhere - but a latch left armed would refuse
+// every later request, turning one failed upload into a client that can never
+// make another.
+TEST(SoftwareHttpClientTest, AFailedUploadLeavesTheClientUsable) {
+  ClientUnderTest test;
+  test.SuppressResponse();
+  test.SetFailSendAt(1);  // the first chunk; the head still goes out
+  test.client().SetChunkedUpload(true);
+  ASSERT_TRUE(test.client().Open("POST", "http://example.com/").has_value());
+  ASSERT_FALSE(test.client().Write("hello", 5).has_value());
+
+  test.SetResponse(kOkResponse);
+  auto next = test.client().Open("GET", "http://example.com/");
+
+  ASSERT_TRUE(next.has_value()) << next.error().Message();
 }
 
 // A body measured up front and a body streamed afterwards cannot both be the
