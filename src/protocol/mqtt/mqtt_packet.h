@@ -86,6 +86,13 @@ struct MqttPublishMessage {
   // Zero for QoS 0, which carries no packet id. The header's QoS is the only
   // thing that distinguishes the two layouts on the wire.
   uint16_t packet_id = 0;
+  // The delivery properties the fixed header carried, kept with the message
+  // rather than with the packet that decoded it: a QoS 2 message is held until
+  // the PUBREL, and is delivered from that later packet, by which time the
+  // header it arrived under is gone. Always 0..2, as ParsePublish refuses
+  // anything else.
+  uint8_t qos = 0;
+  bool retain = false;
   std::string payload;
 };
 

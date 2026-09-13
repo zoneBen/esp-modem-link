@@ -90,7 +90,10 @@ class SoftwareMqttClient : public MqttClient {
   void HandleSuback(const MqttPacket& packet);
   void HandleUnsuback(const MqttPacket& packet);
 
-  void Deliver(const MqttPublishMessage& message);
+  // Takes the decoded message by rvalue reference so its strings can be moved
+  // into the MqttMessage the callback receives: an inbound payload may be the
+  // largest thing on the heap, and nothing else needs the copy.
+  void Deliver(MqttPublishMessage&& message);
 
   // Sends one packet, or reports why it could not be sent. Safe to call from
   // the keep-alive task: the transport is held by shared_ptr for the duration

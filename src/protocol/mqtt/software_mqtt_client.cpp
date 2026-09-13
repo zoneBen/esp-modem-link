@@ -446,6 +446,18 @@ void SoftwareMqttClient::HandleConnack(const MqttPacket& packet) {
 }
 
 void SoftwareMqttClient::HandlePublish(const MqttPacket& packet) {
+  // Both QoS bits set is not a QoS this protocol has; it is a violation of it,
+  // and the specification is explicit that the connection is then closed
+  // ([MQTT-3.3.1-4]). Checked here rather than left to ParsePublish, which
+  // reports the same packet as merely unreadable - and an unreadable PUBLISH is
+  // not something the protocol asks a client to hang up over.
+  if (packet.header.qos > 2) {
+    ReportError(NetworkError(NetworkErrc::kProtocolError, packet.header.qos,
+                             "PUBLISH with both QoS bits set"));
+    Teardown(false);
+    return;
+  }
+
   auto message = ParsePublish(packet.header, packet.body);
   if (!message.has_value()) {
     ReportError(NetworkError(NetworkErrc::kProtocolError, 0,
@@ -472,7 +484,7 @@ void SoftwareMqttClient::HandlePublish(const MqttPacket& packet) {
     // deliver the same message twice.
     SendPacket(EncodePacketIdAck(MqttPacketType::kPuback, message->packet_id));
   }
-  Deliver(*message);
+  Deliver(std::move(*message));
 }
 
 void SoftwareMqttClient::HandlePubrec(const MqttPacket& packet) {
@@ -508,7 +520,7 @@ void SoftwareMqttClient::HandlePubrel(const MqttPacket& packet) {
   // have no record of still needs its PUBCOMP, or the broker will keep sending
   // it. What it must not do is deliver a message that was not there.
   SendPacket(EncodePacketIdAck(MqttPacketType::kPubcomp, *packet_id));
-  if (message.has_value()) Deliver(*message);
+  if (message.has_value()) Deliver(std::move(*message));
 }
 
 void SoftwareMqttClient::HandlePublishComplete(const MqttPacket& packet) {
@@ -564,8 +576,17 @@ void SoftwareMqttClient::HandleUnsuback(const MqttPacket& packet) {
   pending_topics_.erase(*packet_id);
 }
 
-void SoftwareMqttClient::Deliver(const MqttPublishMessage& message) {
-  if (on_message_) on_message_(message.topic, message.payload);
+void SoftwareMqttClient::Deliver(MqttPublishMessage&& message) {
+  if (!on_message_) return;
+  MqttMessage delivered;
+  delivered.topic = std::move(message.topic);
+  delivered.payload = std::move(message.payload);
+  // ParsePublish refuses a QoS above 2, and HandlePublish ends the connection
+  // before that on one, so every value that reaches here is one the enum names.
+  delivered.qos = static_cast<MqttQoS>(message.qos);
+  delivered.retain = message.retain;
+  delivered.message_id = static_cast<int>(message.packet_id);
+  on_message_(std::move(delivered));
 }
 
 void SoftwareMqttClient::ReportError(const NetworkError& error) {

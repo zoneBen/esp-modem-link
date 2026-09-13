@@ -38,7 +38,8 @@ std::string BrokerConnack(uint8_t return_code) {
 std::string BrokerPublish(std::string_view topic,
                           std::string_view payload,
                           uint8_t qos,
-                          uint16_t packet_id = 0) {
+                          uint16_t packet_id = 0,
+                          bool retain = false) {
   std::string body;
   body.push_back(static_cast<char>(topic.size() >> 8));
   body.push_back(static_cast<char>(topic.size() & 0xFF));
@@ -52,6 +53,7 @@ std::string BrokerPublish(std::string_view topic,
   MqttFixedHeader header;
   header.type = MqttPacketType::kPublish;
   header.qos = qos;
+  header.retain = retain;
   return EncodePacket(header, body);
 }
 
@@ -446,32 +448,60 @@ TEST(SoftwareMqttClientTest, AnInboundQoS0PublishReachesOnMessage) {
   ClientUnderTest test;
   test.ConnectAndAccept();
 
-  std::string topic;
-  std::string payload;
-  test.client().OnMessage([&](std::string_view t, std::string_view p) {
-    topic = std::string(t);
-    payload = std::string(p);
+  std::vector<MqttMessage> received;
+  test.client().OnMessage([&](const MqttMessage& message) {
+    received.push_back(message);
   });
 
   ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 0)));
 
-  EXPECT_EQ(topic, "a/b");
-  EXPECT_EQ(payload, "hello");
+  ASSERT_EQ(received.size(), 1u);
+  EXPECT_EQ(received[0].topic, "a/b");
+  EXPECT_EQ(received[0].payload, "hello");
+  EXPECT_EQ(received[0].qos, MqttQoS::kQoS0);
+  EXPECT_FALSE(received[0].retain);
+  // QoS 0 has no packet id on the wire, so there is none to report.
+  EXPECT_EQ(received[0].message_id, 0);
   // QoS 0 is not acknowledged: there is nothing to acknowledge.
   EXPECT_EQ(test.sends().size(), 1u);
+}
+
+// The flag the broker set on the PUBLISH, not a guess from anything else: a
+// retained message and one that merely matched a filter arrive identically
+// apart from this bit.
+TEST(SoftwareMqttClientTest, ARetainedPublishIsReportedAsRetained) {
+  ClientUnderTest test;
+  test.ConnectAndAccept();
+
+  std::vector<MqttMessage> received;
+  test.client().OnMessage(
+      [&](const MqttMessage& message) { received.push_back(message); });
+
+  ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 0, 0,
+                                                     /*retain=*/true)));
+  // And a plain one is not, which is what makes the assertion above about the
+  // flag rather than about the field defaulting to true.
+  ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 0)));
+
+  ASSERT_EQ(received.size(), 2u);
+  EXPECT_TRUE(received[0].retain);
+  EXPECT_FALSE(received[1].retain);
 }
 
 TEST(SoftwareMqttClientTest, AnInboundQoS1PublishIsAcknowledgedAndDelivered) {
   ClientUnderTest test;
   test.ConnectAndAccept();
 
-  std::string payload;
+  std::vector<MqttMessage> received;
   test.client().OnMessage(
-      [&](std::string_view, std::string_view p) { payload = std::string(p); });
+      [&](const MqttMessage& message) { received.push_back(message); });
 
   ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 1, 9)));
 
-  EXPECT_EQ(payload, "hello");
+  ASSERT_EQ(received.size(), 1u);
+  EXPECT_EQ(received[0].payload, "hello");
+  EXPECT_EQ(received[0].qos, MqttQoS::kQoS1);
+  EXPECT_EQ(received[0].message_id, 9);
   ASSERT_EQ(test.sends().size(), 2u);
   EXPECT_EQ(FirstByte(test.sends()[1]), 0x40);  // PUBACK
   auto packet = TakePacket(*const_cast<std::string*>(&test.sends()[1]));
@@ -487,12 +517,12 @@ TEST(SoftwareMqttClientTest, AnInboundQoS2PublishIsHeldUntilPubrel) {
   ClientUnderTest test;
   test.ConnectAndAccept();
 
-  std::vector<std::string> received;
-  test.client().OnMessage([&](std::string_view, std::string_view p) {
-    received.push_back(std::string(p));
-  });
+  std::vector<MqttMessage> received;
+  test.client().OnMessage(
+      [&](const MqttMessage& message) { received.push_back(message); });
 
-  ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 2, 9)));
+  ASSERT_TRUE(test.transport().Deliver(
+      BrokerPublish("a/b", "hello", 2, 9, /*retain=*/true)));
 
   EXPECT_TRUE(received.empty());
   ASSERT_EQ(test.sends().size(), 2u);
@@ -500,7 +530,13 @@ TEST(SoftwareMqttClientTest, AnInboundQoS2PublishIsHeldUntilPubrel) {
 
   ASSERT_TRUE(test.transport().Deliver(BrokerAck(MqttPacketType::kPubrel, 9)));
   ASSERT_EQ(received.size(), 1u);
-  EXPECT_EQ(received[0], "hello");
+  EXPECT_EQ(received[0].payload, "hello");
+  // Read off the PUBLISH that arrived two packets ago. The properties have to
+  // be held with the message for the length of that wait, and this is the only
+  // path where they cannot simply be read from the packet being handled.
+  EXPECT_EQ(received[0].qos, MqttQoS::kQoS2);
+  EXPECT_EQ(received[0].message_id, 9);
+  EXPECT_TRUE(received[0].retain);
   ASSERT_EQ(test.sends().size(), 3u);
   EXPECT_EQ(FirstByte(test.sends()[2]), 0x70);  // PUBCOMP
 }
@@ -512,9 +548,7 @@ TEST(SoftwareMqttClientTest, ARepeatedQoS2PublishIsNotDeliveredTwice) {
   test.ConnectAndAccept();
 
   int received = 0;
-  test.client().OnMessage([&](std::string_view, std::string_view) {
-    ++received;
-  });
+  test.client().OnMessage([&](const MqttMessage&) { ++received; });
 
   ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 2, 9)));
   ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "hello", 2, 9)));
@@ -530,9 +564,7 @@ TEST(SoftwareMqttClientTest, APubrelForAnUnknownIdIsAnsweredWithoutDelivering) {
   test.ConnectAndAccept();
 
   int received = 0;
-  test.client().OnMessage([&](std::string_view, std::string_view) {
-    ++received;
-  });
+  test.client().OnMessage([&](const MqttMessage&) { ++received; });
 
   ASSERT_TRUE(test.transport().Deliver(BrokerAck(MqttPacketType::kPubrel, 77)));
 
@@ -548,9 +580,8 @@ TEST(SoftwareMqttClientTest, TwoPacketsInOneReadAreBothDelivered) {
   test.ConnectAndAccept();
 
   std::vector<std::string> received;
-  test.client().OnMessage([&](std::string_view, std::string_view p) {
-    received.push_back(std::string(p));
-  });
+  test.client().OnMessage(
+      [&](const MqttMessage& message) { received.push_back(message.payload); });
 
   ASSERT_TRUE(test.transport().Deliver(BrokerPublish("a/b", "one", 0) +
                                        BrokerPublish("a/b", "two", 0)));
@@ -565,9 +596,8 @@ TEST(SoftwareMqttClientTest, APacketSplitAcrossTwoReadsIsDeliveredOnce) {
   test.ConnectAndAccept();
 
   std::vector<std::string> received;
-  test.client().OnMessage([&](std::string_view, std::string_view p) {
-    received.push_back(std::string(p));
-  });
+  test.client().OnMessage(
+      [&](const MqttMessage& message) { received.push_back(message.payload); });
 
   const std::string packet = BrokerPublish("a/b", "hello", 0);
   ASSERT_TRUE(test.transport().Deliver(packet.substr(0, 3)));
@@ -576,6 +606,56 @@ TEST(SoftwareMqttClientTest, APacketSplitAcrossTwoReadsIsDeliveredOnce) {
 
   ASSERT_EQ(received.size(), 1u);
   EXPECT_EQ(received[0], "hello");
+}
+
+// A PUBLISH the client cannot read is reported and skipped: the bytes were
+// framed correctly enough to be taken off the stream, so the session is still
+// usable and hanging up over it would be worse than dropping the message.
+TEST(SoftwareMqttClientTest, AMalformedPublishIsReportedAndSkipped) {
+  ClientUnderTest test;
+  test.ConnectAndAccept();
+
+  std::vector<NetworkError> errors;
+  test.client().OnError(
+      [&](const NetworkError& error) { errors.push_back(error); });
+  int received = 0;
+  test.client().OnMessage([&](MqttMessage) { ++received; });
+
+  // A topic length claiming five bytes with only three behind it.
+  MqttFixedHeader header;
+  header.type = MqttPacketType::kPublish;
+  const std::string body = std::string("\x00\x05", 2) + "abc";
+  ASSERT_TRUE(test.transport().Deliver(EncodePacket(header, body)));
+
+  ASSERT_EQ(errors.size(), 1u);
+  EXPECT_EQ(errors[0].code, NetworkErrc::kProtocolError);
+  EXPECT_EQ(received, 0);
+  EXPECT_TRUE(test.client().IsConnected());
+}
+
+// Both QoS bits set is not a QoS this protocol has. The specification requires
+// the connection to be closed over it ([MQTT-3.3.1-4]) rather than the packet
+// ignored, which is what separates this case from the malformed one above.
+TEST(SoftwareMqttClientTest, APublishWithBothQoSBitsSetEndsTheConnection) {
+  ClientUnderTest test;
+  test.ConnectAndAccept();
+
+  std::vector<NetworkError> errors;
+  test.client().OnError(
+      [&](const NetworkError& error) { errors.push_back(error); });
+  int received = 0;
+  test.client().OnMessage([&](MqttMessage) { ++received; });
+
+  ASSERT_TRUE(
+      test.transport().Deliver(BrokerPublish("a/b", "hello", /*qos=*/3)));
+
+  ASSERT_EQ(errors.size(), 1u);
+  EXPECT_EQ(errors[0].code, NetworkErrc::kProtocolError);
+  // The bits themselves, which is all the packet said about itself.
+  EXPECT_EQ(errors[0].native, 3);
+  EXPECT_EQ(received, 0);
+  EXPECT_FALSE(test.client().IsConnected());
+  EXPECT_EQ(test.state().disconnect_calls, 1);
 }
 
 // A stream whose length field never completes would otherwise be buffered

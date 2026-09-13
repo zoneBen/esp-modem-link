@@ -265,6 +265,7 @@ TEST(MqttPublishParseTest, AQoS1PacketIsReadByItsHeaderNotItsShape) {
   MqttFixedHeader header;
   header.type = MqttPacketType::kPublish;
   header.qos = 1;
+  header.retain = true;
   const std::string body = Bytes({0x00, 0x03}) + "abc" + Bytes({0x00, 0x2A}) +
                            "hello";
   auto message = ParsePublish(header, body);
@@ -272,6 +273,10 @@ TEST(MqttPublishParseTest, AQoS1PacketIsReadByItsHeaderNotItsShape) {
   EXPECT_EQ(message->topic, "abc");
   EXPECT_EQ(message->packet_id, 42);
   EXPECT_EQ(message->payload, "hello");
+  // The delivery properties come off the header with the rest, because the
+  // caller who receives this message is not holding the header.
+  EXPECT_EQ(message->qos, 1);
+  EXPECT_TRUE(message->retain);
 
   // The same bytes read as QoS 0 are a topic followed by a payload that starts
   // with the packet id - which is exactly why the header decides.
@@ -279,6 +284,7 @@ TEST(MqttPublishParseTest, AQoS1PacketIsReadByItsHeaderNotItsShape) {
   message = ParsePublish(header, body);
   ASSERT_TRUE(message.has_value());
   EXPECT_EQ(message->packet_id, 0);
+  EXPECT_EQ(message->qos, 0);
   EXPECT_EQ(message->payload, Bytes({0x00, 0x2A}) + "hello");
 }
 
@@ -293,6 +299,17 @@ TEST(MqttPublishParseTest, RefusesABodyThatEndsMidField) {
   // not: the id is not optional at that QoS.
   header.qos = 1;
   EXPECT_FALSE(ParsePublish(header, Bytes({0x00, 0x03}) + "abc").has_value());
+}
+
+// The QoS field is two bits, so 3 is a value the wire can carry and MQTT has no
+// meaning for. It has to stop here rather than reach a caller as a delivery
+// property: the QoS the message came under is what the caller trusts.
+TEST(MqttPublishParseTest, RefusesAQoSTheProtocolDoesNotHave) {
+  MqttFixedHeader header;
+  header.type = MqttPacketType::kPublish;
+  header.qos = 3;
+  const std::string body = Bytes({0x00, 0x03}) + "abc" + "hello";
+  EXPECT_FALSE(ParsePublish(header, body).has_value());
 }
 
 TEST(MqttSubackTest, ReadsTheGrantedQoSOfEveryFilter) {

@@ -152,6 +152,8 @@ std::optional<MqttPublishMessage> ParsePublish(const MqttFixedHeader& header,
 
   MqttPublishMessage message;
   message.topic = std::string(*topic);
+  message.qos = header.qos;
+  message.retain = header.retain;
   if (header.qos > 0) {
     if (offset + 2 > body.size()) return std::nullopt;
     message.packet_id =
