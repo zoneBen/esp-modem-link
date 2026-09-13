@@ -48,10 +48,12 @@ class MockHal : public IModuleHal {
 
   Result<int> TcpConnect(std::string_view host,
                          uint16_t port,
-                         bool ssl = false) override {
+                         bool ssl = false,
+                         const TlsConfig& config = {}) override {
     (void)host;
     (void)port;
     (void)ssl;
+    (void)config;
     return next_connect_id++;
   }
   Result<> TcpClose(int connect_id) override {

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -20,6 +21,12 @@ namespace {
 
 class FullCapsHal : public IModuleHal {
  public:
+  // What the last TcpConnect was asked for. Public because the subclasses below
+  // inherit it and the tests read it through them.
+  bool last_ssl = false;
+  TlsConfig last_tls_config;
+  bool fail_tcp_connect = false;
+
   ModuleType GetModuleType() const override { return ModuleType::kMl307; }
   std::string_view GetModuleName() const override { return "FullCaps"; }
   const ModuleCapabilities& GetCapabilities() const override {
@@ -62,11 +69,23 @@ class FullCapsHal : public IModuleHal {
     return {};
   }
 
-  Result<int> TcpConnect(std::string_view host, uint16_t port,
-                         bool ssl = false) override {
+  Result<int> TcpConnect(std::string_view host,
+                         uint16_t port,
+                         bool ssl = false,
+                         const TlsConfig& config = {}) override {
     (void)host;
     (void)port;
-    (void)ssl;
+    last_ssl = ssl;
+    // Recorded rather than ignored: what the engines above hand down is the
+    // subject of the TLS tests, and a stub that dropped it could not tell a
+    // config that was plumbed through from one that never left the caller.
+    last_tls_config = config;
+    // Refusing the socket is how a test that only cares what the engine asked
+    // for avoids waiting out a response that no one is going to send.
+    if (fail_tcp_connect) {
+      return std::unexpected(
+          NetworkError(NetworkErrc::kConnectFailed, 0, "mock refuses"));
+    }
     return next_id++;
   }
   Result<> TcpClose(int connect_id) override {
@@ -159,7 +178,10 @@ class NoCapsHal : public IModuleHal {
     return {};
   }
 
-  Result<int> TcpConnect(std::string_view, uint16_t, bool = false) override {
+  Result<int> TcpConnect(std::string_view,
+                         uint16_t,
+                         bool = false,
+                         const TlsConfig& = {}) override {
     return std::unexpected(NetworkError::NotSupported("no tcp"));
   }
   Result<> TcpClose(int) override { return {}; }
@@ -533,6 +555,100 @@ TEST(CellularNetworkTest, CreateWebSocketOnMl307GivesAWorkingClient) {
   ASSERT_TRUE(client.has_value()) << client.error().Message();
   EXPECT_NE(dynamic_cast<protocol::SoftwareWsClient*>(client.value().get()),
             nullptr);
+}
+
+// --- TLS reaches the socket -------------------------------------------------
+
+// A TlsConfig the caller sets on an engine is only worth anything if the engine
+// hands it to the socket it opens. Both engines take it at the point the socket
+// is made - HTTPS at the request's scheme, wss:// at Connect() - so this asserts
+// it arrives, not merely that SetTlsConfig compiled.
+
+TEST(CellularNetworkTest, HttpsCarriesTheCallersTlsConfigDownToTheSocket) {
+  FullCapsHal hal;
+  hal.fail_tcp_connect = true;  // nothing is going to answer a request anyway
+  CellularNetwork net(hal);
+  net.SetProtocolMode(ProtocolMode::kSoftware);
+  auto client = net.CreateHttp();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  client.value()->SetTlsConfig(config);
+
+  auto result = client.value()->Execute("GET", "https://example.com/");
+  ASSERT_FALSE(result.has_value());
+
+  EXPECT_TRUE(hal.last_ssl);
+  EXPECT_TRUE(hal.last_tls_config.verify_certificate);
+  EXPECT_TRUE(hal.last_tls_config.verify_hostname);
+}
+
+TEST(CellularNetworkTest, WssCarriesTheCallersTlsConfigDownToTheSocket) {
+  FullCapsHal hal;
+  hal.fail_tcp_connect = true;
+  CellularNetwork net(hal);
+  auto client = net.CreateWebSocket();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  client.value()->SetTlsConfig(config);
+
+  auto result = client.value()->Connect("wss://server.example/chat");
+  ASSERT_FALSE(result.has_value());
+
+  EXPECT_TRUE(hal.last_ssl);
+  EXPECT_TRUE(hal.last_tls_config.verify_certificate);
+  EXPECT_TRUE(hal.last_tls_config.verify_hostname);
+}
+
+// The plaintext half of both pairs. The config a caller sets describes the TLS
+// connections that client makes, so it must not reach a socket that is not going
+// to handshake: an honest HAL refuses certificate material handed to a plaintext
+// socket, so forwarding it would fail an http:// request with settings the
+// caller never meant to apply to it.
+TEST(CellularNetworkTest, APlaintextRequestIsNotGivenATlsConfig) {
+  FullCapsHal hal;
+  hal.fail_tcp_connect = true;
+  CellularNetwork net(hal);
+  net.SetProtocolMode(ProtocolMode::kSoftware);
+  auto client = net.CreateHttp();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  TlsConfig config;
+  config.ca_cert = "-----BEGIN CERTIFICATE-----";
+  config.handshake_timeout = std::chrono::seconds(45);
+  client.value()->SetTlsConfig(config);
+
+  auto result = client.value()->Execute("GET", "http://example.com/");
+  ASSERT_FALSE(result.has_value());
+
+  EXPECT_FALSE(hal.last_ssl);
+  EXPECT_TRUE(hal.last_tls_config.ca_cert.empty());
+  EXPECT_EQ(hal.last_tls_config.handshake_timeout, std::chrono::seconds(10));
+}
+
+TEST(CellularNetworkTest, APlainWebSocketIsNotGivenATlsConfig) {
+  FullCapsHal hal;
+  hal.fail_tcp_connect = true;
+  CellularNetwork net(hal);
+  auto client = net.CreateWebSocket();
+  ASSERT_TRUE(client.has_value()) << client.error().Message();
+
+  TlsConfig config;
+  config.ca_cert = "-----BEGIN CERTIFICATE-----";
+  config.handshake_timeout = std::chrono::seconds(45);
+  client.value()->SetTlsConfig(config);
+
+  auto result = client.value()->Connect("ws://server.example/chat");
+  ASSERT_FALSE(result.has_value());
+
+  EXPECT_FALSE(hal.last_ssl);
+  EXPECT_TRUE(hal.last_tls_config.ca_cert.empty());
+  EXPECT_EQ(hal.last_tls_config.handshake_timeout, std::chrono::seconds(10));
 }
 
 }  // namespace

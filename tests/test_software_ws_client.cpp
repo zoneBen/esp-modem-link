@@ -133,9 +133,10 @@ class ClientUnderTest {
   explicit ClientUnderTest(
       std::chrono::milliseconds handshake_timeout = std::chrono::seconds(2)) {
     client_ = std::make_unique<SoftwareWsClient>(
-        [this](bool tls) -> Result<std::unique_ptr<TcpClient>> {
+        [this](bool tls, const TlsConfig& config) -> Result<std::unique_ptr<TcpClient>> {
           auto state = std::make_shared<MockState>();
           state->was_tls = tls;
+          state->last_tls_config = config;
 
           MockTcpClient::Script script = script_;
           size_t index = 0;
@@ -289,6 +290,43 @@ TEST(SoftwareWsClientTest, ReadsTheSchemeForThePortAndForTls) {
 
   EXPECT_EQ(test.state().last_port, 443);
   EXPECT_TRUE(test.state().was_tls);
+}
+
+// The config is read when the connection is built, like the headers and for the
+// same reason: the upgrade is a single request whose URL is known in advance, so
+// a config set after it starts applies to the next connection rather than to a
+// handshake that has already begun.
+TEST(SoftwareWsClientTest, HandsTheTlsConfigToTheTransportItOpens) {
+  ClientUnderTest test;
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  config.handshake_timeout = std::chrono::seconds(45);
+  test.client().SetTlsConfig(config);
+
+  test.ConnectAndAccept("wss://server.example/chat");
+
+  EXPECT_TRUE(test.state().last_tls_config.verify_certificate);
+  EXPECT_TRUE(test.state().last_tls_config.verify_hostname);
+  EXPECT_EQ(test.state().last_tls_config.handshake_timeout,
+            std::chrono::seconds(45));
+}
+
+TEST(SoftwareWsClientTest, ASecondConnectionGetsTheConfigSetInBetween) {
+  ClientUnderTest test;
+  test.ConnectAndAccept("wss://server.example/chat");
+  // The first connection got the default, which asks for no verification.
+  EXPECT_FALSE(test.state().last_tls_config.verify_certificate);
+
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  test.client().SetTlsConfig(config);
+  test.client().Close();
+  test.ConnectAndAccept("wss://server.example/chat");
+
+  EXPECT_EQ(test.transport_count(), 2u);
+  EXPECT_TRUE(test.state(1).last_tls_config.verify_certificate);
 }
 
 TEST(SoftwareWsClientTest, KeepsAPortThatIsNotTheSchemesDefault) {

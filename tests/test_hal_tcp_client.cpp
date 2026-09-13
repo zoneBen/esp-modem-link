@@ -51,10 +51,12 @@ class MockHal : public IModuleHal {
   // TCP
   Result<int> TcpConnect(std::string_view host,
                          uint16_t port,
-                         bool ssl = false) override {
+                         bool ssl = false,
+                         const TlsConfig& config = {}) override {
     last_host = std::string(host);
     last_port = port;
     last_ssl = ssl;
+    last_tls_config = config;
     last_connect_id = next_connect_id;
     tcp_connect_calls++;
     if (fail_tcp_connect) {
@@ -117,6 +119,7 @@ class MockHal : public IModuleHal {
   std::string last_host;
   uint16_t last_port = 0;
   bool last_ssl = false;
+  TlsConfig last_tls_config;
   int last_connect_id = -1;
   int last_close_id = -1;
   int last_send_id = -1;
@@ -150,6 +153,44 @@ TEST(HalTcpClientTest, SslConnectSetsSslFlag) {
   auto result = client.Connect("example.com", 443);
   EXPECT_TRUE(result.has_value());
   EXPECT_TRUE(hal.last_ssl);
+}
+
+// The config is held from construction and spent on the next Connect, because
+// the handshake happens inside TcpConnect and nothing here can re-key an open
+// socket.
+TEST(HalTcpClientTest, SslConnectPassesTheTlsConfigToTheHal) {
+  MockHal hal;
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  config.handshake_timeout = std::chrono::seconds(45);
+  HalTcpClient client(hal, true, config);
+
+  ASSERT_TRUE(client.Connect("example.com", 443).has_value());
+
+  EXPECT_TRUE(hal.last_tls_config.verify_certificate);
+  EXPECT_TRUE(hal.last_tls_config.verify_hostname);
+  EXPECT_EQ(hal.last_tls_config.handshake_timeout, std::chrono::seconds(45));
+}
+
+// The transport is not the layer that decides what a plaintext socket may carry:
+// it forwards what it was constructed with, and the HAL is what refuses
+// certificate material handed to a socket that will not handshake. So the config
+// does arrive here, with the TLS flag off, and the assertions below are on the
+// two things this class is responsible for - forwarding the value as given and
+// not turning TLS on.
+TEST(HalTcpClientTest, APlaintextClientForwardsItsConfigWithTlsOff) {
+  MockHal hal;
+  TlsConfig config;
+  config.ca_cert = "PEM";
+  config.handshake_timeout = std::chrono::seconds(45);
+  HalTcpClient client(hal, false, config);
+
+  ASSERT_TRUE(client.Connect("example.com", 80).has_value());
+
+  EXPECT_FALSE(hal.last_ssl);
+  EXPECT_EQ(hal.last_tls_config.ca_cert, "PEM");
+  EXPECT_EQ(hal.last_tls_config.handshake_timeout, std::chrono::seconds(45));
 }
 
 TEST(HalTcpClientTest, ConnectFailureReturnsError) {

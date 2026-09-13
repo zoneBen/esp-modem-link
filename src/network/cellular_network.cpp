@@ -62,18 +62,19 @@ Result<std::unique_ptr<HttpClient>> CellularNetwork::CreateHttp() {
   return std::unique_ptr<HttpClient>(
       std::make_unique<protocol::SoftwareHttpClient>(
           [this](bool tls, const TlsConfig& config) {
-            (void)config;
-            return OpenTransport(tls);
+            return OpenTransport(tls, config);
           }));
 }
 
-Result<std::unique_ptr<TcpClient>> CellularNetwork::OpenTransport(bool tls) {
+Result<std::unique_ptr<TcpClient>> CellularNetwork::OpenTransport(
+    bool tls,
+    const TlsConfig& config) {
   if (tls && !hal_.GetCapabilities().ssl_tcp) {
     return std::unexpected(NetworkError::NotSupported(
         "TLS is required here, and this module does not support it"));
   }
   return std::unique_ptr<TcpClient>(
-      std::make_unique<hal::HalTcpClient>(hal_, tls));
+      std::make_unique<hal::HalTcpClient>(hal_, tls, config));
 }
 
 Result<std::unique_ptr<MqttClient>> CellularNetwork::CreateMqtt() {
@@ -97,8 +98,7 @@ Result<std::unique_ptr<MqttClient>> CellularNetwork::CreateMqtt() {
   return std::unique_ptr<MqttClient>(
       std::make_unique<protocol::SoftwareMqttClient>(
           [this](bool tls, const TlsConfig& config) {
-            (void)config;
-            return OpenTransport(tls);
+            return OpenTransport(tls, config);
           }));
 }
 
@@ -112,11 +112,14 @@ Result<std::unique_ptr<WebSocketClient>> CellularNetwork::CreateWebSocket() {
   }
 
   // The scheme decides whether the socket is under TLS - wss:// against ws:// -
-  // so there is nothing for a caller to configure here, which is the one place
-  // this factory differs from the HTTP and MQTT ones.
+  // so the flag below is the client's reading of the URL rather than something a
+  // caller configures; the config next to it is SetTlsConfig()'s and is unused
+  // by a ws:// connection.
   return std::unique_ptr<WebSocketClient>(
       std::make_unique<protocol::SoftwareWsClient>(
-          [this](bool tls) { return OpenTransport(tls); }));
+          [this](bool tls, const TlsConfig& config) {
+            return OpenTransport(tls, config);
+          }));
 }
 
 bool CellularNetwork::HasCapability(NetworkProtocol proto) const {

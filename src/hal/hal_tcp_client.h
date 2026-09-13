@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "esp_modem_link/config_types.h"
 #include "esp_modem_link/tcp_client.h"
 #include "hal/imodule_hal.h"
 
@@ -10,7 +11,13 @@ namespace esp_modem_link::hal {
 
 class HalTcpClient : public TcpClient {
  public:
-  explicit HalTcpClient(IModuleHal& hal, bool ssl = false);
+  // The config is a constructor argument rather than a Connect parameter
+  // because the engines above hold a client across connects and set TLS once,
+  // but it only takes effect on the next Connect: the handshake is performed by
+  // TcpConnect, and nothing here can re-key an open socket.
+  explicit HalTcpClient(IModuleHal& hal,
+                        bool ssl = false,
+                        const TlsConfig& config = {});
   ~HalTcpClient() override;
 
   Result<> Connect(std::string_view host, uint16_t port) override;
@@ -25,6 +32,7 @@ class HalTcpClient : public TcpClient {
 
   IModuleHal& hal_;
   bool ssl_ = false;
+  TlsConfig tls_config_;
   HalSubscription subscription_ = 0;
   int connect_id_ = -1;
 };

@@ -60,6 +60,19 @@ void ExpectOpenOnAnyId(MockAtChannel& channel) {
       .Respond("OK\r\n");
 }
 
+// Position of the first command starting with `prefix`, or SentCommands().size()
+// when it was never sent. The order the socket settings go out in is part of the
+// module's contract rather than an implementation detail: AT+MIPOPEN is what
+// performs the TLS handshake, so everything the handshake reads has to be on the
+// module before it is sent.
+size_t CommandIndex(const MockAtChannel& channel, std::string_view prefix) {
+  const auto& commands = channel.SentCommands();
+  for (size_t i = 0; i < commands.size(); ++i) {
+    if (commands[i].rfind(prefix, 0) == 0) return i;
+  }
+  return commands.size();
+}
+
 class Ml307HalTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -370,17 +383,190 @@ TEST_F(Ml307HalTest, TcpConnectConfiguresEncodingForTheSocket) {
   EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"encoding\",0,1,1"));
 }
 
-// TLS is a per-cid setting applied before MIPOPEN, not an argument to it.
+// TLS is a per-cid setting applied before MIPOPEN, not an argument to it, and the
+// verification settings live in an SSL context that the socket names when it is
+// opened. The context is the cid, so for the first socket both are 0.
 TEST_F(Ml307HalTest, TcpConnectSsl) {
+  ExpectTcpOpen(channel_, 0, /*ssl=*/true);
+
+  // Verification is asked for explicitly rather than taken from the default,
+  // because the default does not ask for it - see the test below.
+  TlsConfig verifying;
+  verifying.verify_certificate = true;
+  verifying.verify_hostname = true;
+  auto result = hal_->TcpConnect("example.com", 443, true, verifying);
+  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
+
+  // Asked to verify, the module is told to check the server.
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"auth\",0,1"));
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"negotime\",0,10"));
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"ssl\",0,1,0"));
+  EXPECT_TRUE(
+      channel_.WasCommandSent("AT+MIPOPEN=0,\"TCP\",\"example.com\",443,,0"));
+
+  // AT+MIPOPEN performs the handshake, so everything it reads has to be written
+  // first - including negotime, which is the budget that handshake gets. Each
+  // setting is compared against the open individually rather than through one
+  // "AT+MSSLCFG" prefix, because CommandIndex returns the first match and an
+  // auth written early would otherwise stand in for a negotime written late.
+  EXPECT_LT(CommandIndex(channel_, "AT+MSSLCFG=\"auth\""),
+            CommandIndex(channel_, "AT+MIPOPEN"));
+  EXPECT_LT(CommandIndex(channel_, "AT+MSSLCFG=\"negotime\""),
+            CommandIndex(channel_, "AT+MIPOPEN"));
+  EXPECT_LT(CommandIndex(channel_, "AT+MIPCFG=\"ssl\""),
+            CommandIndex(channel_, "AT+MIPOPEN"));
+  EXPECT_LT(CommandIndex(channel_, "AT+MIPCFG=\"ssl\""),
+            CommandIndex(channel_, "AT+MIPCFG=\"encoding\""));
+  EXPECT_LT(CommandIndex(channel_, "AT+MIPCFG=\"encoding\""),
+            CommandIndex(channel_, "AT+MIPOPEN"));
+}
+
+// The library's default is a TLS connection that is encrypted but not
+// authenticated, which is what these modules do as shipped and what the library
+// this one was ported from does unconditionally. Pinned as a test because it is
+// a decision rather than an omission: a caller who wants the server checked has
+// to say so, and a HAL that cannot honour that has to report it - which is what
+// the refusal tests below are for.
+TEST_F(Ml307HalTest, TheDefaultTlsConfigAsksTheModuleForNothing) {
   ExpectTcpOpen(channel_, 0, /*ssl=*/true);
 
   auto result = hal_->TcpConnect("example.com", 443, true);
   ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
 
   EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"auth\",0,0"));
+}
+
+// auth 0 asks the module to verify nothing, which is what a caller who turned
+// both checks off has asked for.
+TEST_F(Ml307HalTest, TcpConnectSslWithoutVerificationAsksTheModuleForNothing) {
+  ExpectTcpOpen(channel_, 0, /*ssl=*/true);
+
+  TlsConfig config;
+  config.verify_certificate = false;
+  config.verify_hostname = false;
+  auto result = hal_->TcpConnect("example.com", 443, true, config);
+  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
+
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"auth\",0,0"));
   EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"ssl\",0,1,0"));
-  EXPECT_TRUE(
-      channel_.WasCommandSent("AT+MIPOPEN=0,\"TCP\",\"example.com\",443,,0"));
+}
+
+// The module's negotime is 10-300 s, so a value inside that range goes out as
+// given rather than as the default.
+TEST_F(Ml307HalTest, TcpConnectSslWritesTheHandshakeTimeoutItWasGiven) {
+  ExpectTcpOpen(channel_, 0, /*ssl=*/true);
+
+  TlsConfig config;
+  config.handshake_timeout = std::chrono::seconds(45);
+  auto result = hal_->TcpConnect("example.com", 443, true, config);
+  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
+
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"negotime\",0,45"));
+}
+
+// Two TLS sockets have to be able to disagree about what they verify, and their
+// settings have to be on the module before the handshake MIPOPEN performs. One
+// shared context would let the second connection's writes land between the first
+// one's write and its handshake; the cid is used instead, and the module reports
+// six of each, so no second pool is needed to keep them apart.
+TEST_F(Ml307HalTest, TcpConnectSslGivesEachSocketItsOwnContext) {
+  ExpectTcpOpen(channel_, 0, /*ssl=*/true);
+  ExpectTcpOpen(channel_, 1, /*ssl=*/true);
+
+  // The two sockets are given opposite answers on purpose: with settings that
+  // agreed, a shared context would produce the same commands as separate ones
+  // and this would pass either way.
+  TlsConfig strict;
+  strict.verify_certificate = true;
+  strict.verify_hostname = true;
+  ASSERT_TRUE(hal_->TcpConnect("a.example.com", 443, true, strict).has_value());
+
+  TlsConfig lax;
+  lax.verify_certificate = false;
+  lax.verify_hostname = false;
+  auto second = hal_->TcpConnect("b.example.com", 443, true, lax);
+  ASSERT_TRUE(second.has_value()) << "error: " << second.error().context;
+  ASSERT_EQ(second.value(), 1);
+
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"auth\",0,1"));
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MSSLCFG=\"auth\",1,0"));
+  // The fourth field is the context the socket uses: the cid, not a shared one.
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"ssl\",1,1,1"));
+}
+
+// Certificate material is a guarantee the caller asked for, and this library has
+// no way to put a certificate on the module: AT+MSSLCFG="cert" takes a file the
+// module already holds. Refused rather than dropped, because the connection that
+// came up without the check is a weaker one than the caller believes they have.
+TEST_F(Ml307HalTest, TcpConnectRefusesCertificateMaterialItCannotInstall) {
+  TlsConfig config;
+  config.ca_cert = "-----BEGIN CERTIFICATE-----";
+
+  auto result = hal_->TcpConnect("example.com", 443, true, config);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+  EXPECT_NE(result.error().context.find("cert"), std::string::npos);
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
+
+  // The cid is given back, so a config the module cannot take does not cost a
+  // socket. Which cid the retry lands on is the allocator's business: the one
+  // just released is quarantined.
+  ExpectOpenOnAnyId(channel_);
+  auto retry = hal_->TcpConnect("example.com", 443, true);
+  ASSERT_TRUE(retry.has_value()) << "error: " << retry.error().context;
+  EXPECT_GE(retry.value(), 0);
+}
+
+TEST_F(Ml307HalTest, TcpConnectRefusesAlpnTheModuleHasNoSettingFor) {
+  TlsConfig config;
+  config.alpn_protocols = "h2,http/1.1";
+
+  auto result = hal_->TcpConnect("example.com", 443, true, config);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+  EXPECT_NE(result.error().context.find("ALPN"), std::string::npos);
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
+}
+
+// auth 0 verifies nothing and auth 1 verifies the certificate chain and the
+// hostname together. Neither half of the pair can be answered on its own, so
+// asking for one without the other is refused in both directions rather than
+// resolved by guessing which of the two guarantees mattered.
+TEST_F(Ml307HalTest,
+       TcpConnectRefusesToSeparateTheCertificateCheckFromTheHostnameCheck) {
+  TlsConfig hostname_only;
+  hostname_only.verify_certificate = true;
+
+  auto first = hal_->TcpConnect("example.com", 443, true, hostname_only);
+  ASSERT_FALSE(first.has_value());
+  EXPECT_EQ(first.error().code, NetworkErrc::kNotSupported);
+
+  TlsConfig chain_only;
+  chain_only.verify_hostname = true;
+
+  auto second = hal_->TcpConnect("example.com", 443, true, chain_only);
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(second.error().code, NetworkErrc::kNotSupported);
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
+}
+
+// AT+MSSLCFG="negotime" takes 10-300 s. Rounding a value into range would hand
+// the caller a timeout they did not ask for, on the one operation where waiting
+// the wrong length and failing look the same from outside.
+TEST_F(Ml307HalTest, TcpConnectRefusesAHandshakeTimeoutOutsideTheModulesRange) {
+  TlsConfig too_short;
+  too_short.handshake_timeout = std::chrono::seconds(5);
+  auto first = hal_->TcpConnect("example.com", 443, true, too_short);
+  ASSERT_FALSE(first.has_value());
+  EXPECT_EQ(first.error().code, NetworkErrc::kInvalidArgument);
+
+  TlsConfig too_long;
+  too_long.handshake_timeout = std::chrono::seconds(301);
+  auto second = hal_->TcpConnect("example.com", 443, true, too_long);
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(second.error().code, NetworkErrc::kInvalidArgument);
+
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
 }
 
 TEST_F(Ml307HalTest, TcpConnectDisablesSslWhenNotRequested) {
@@ -390,6 +576,53 @@ TEST_F(Ml307HalTest, TcpConnectDisablesSslWhenNotRequested) {
 
   EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"ssl\",0,0,0"));
   EXPECT_FALSE(channel_.WasCommandSent("AT+MSSLCFG"));
+}
+
+// A plaintext socket has no handshake for the rest of a TlsConfig to describe,
+// so those fields are ignored - but certificate material is not. A caller who
+// supplied a CA to check a server against and is about to get an unauthenticated
+// connection has to be told, not left believing the material is in use.
+TEST_F(Ml307HalTest, TcpConnectRefusesCertificateMaterialOnAPlaintextSocket) {
+  TlsConfig config;
+  config.client_key = "-----BEGIN PRIVATE KEY-----";
+
+  auto result = hal_->TcpConnect("example.com", 80, false, config);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kNotSupported);
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
+}
+
+// A plaintext socket does no handshake, so the two flags describe one it will
+// not do and are not written anywhere - there is no SSL context for a socket
+// that is not using one. Asked for verification, which is the case that would
+// matter, and still nothing goes out.
+TEST_F(Ml307HalTest, TcpConnectIgnoresVerificationFlagsOnAPlaintextSocket) {
+  ExpectTcpOpen(channel_, 0);
+
+  TlsConfig config;
+  config.verify_certificate = true;
+  config.verify_hostname = true;
+  auto result = hal_->TcpConnect("example.com", 80, false, config);
+  ASSERT_TRUE(result.has_value()) << "error: " << result.error().context;
+
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MSSLCFG"));
+  EXPECT_TRUE(channel_.WasCommandSent("AT+MIPCFG=\"ssl\",0,0,0"));
+}
+
+// The settings are written per socket, so a module that refuses one answers with
+// an error the caller sees, and the cid goes back to the pool.
+TEST_F(Ml307HalTest, TcpConnectReportsAModuleThatRefusesTheTlsSettings) {
+  channel_.FailCommand("AT+MSSLCFG", AtErrc::kTimeout);
+
+  auto failed = hal_->TcpConnect("example.com", 443, true);
+  ASSERT_FALSE(failed.has_value());
+  EXPECT_FALSE(channel_.WasCommandSent("AT+MIPOPEN"));
+
+  channel_.ClearFailures();
+  ExpectOpenOnAnyId(channel_);
+  auto retry = hal_->TcpConnect("example.com", 443, true);
+  ASSERT_TRUE(retry.has_value()) << "error: " << retry.error().context;
+  EXPECT_GE(retry.value(), 0);
 }
 
 // AT+MIPOPEN returns OK as soon as the request is accepted; the socket is not
@@ -426,6 +659,72 @@ TEST_F(Ml307HalTest, TcpConnectReleasesIdOnFailure) {
   auto ok = hal_->TcpConnect("example.com", 80);
   ASSERT_TRUE(ok.has_value()) << "error: " << ok.error().context;
   EXPECT_GE(ok.value(), 0);
+}
+
+// The handshake happens inside MIPOPEN, so a refusal on a TLS socket is the
+// handshake failing, not the host being unreachable. The distinction is what
+// tells a caller to look at their verification settings rather than their
+// network - and this firmware, which ships no certificate authority, fails
+// exactly this way whenever a socket asks it to verify.
+TEST_F(Ml307HalTest, ATlsSocketThatCannotHandshakeSaysSo) {
+  channel_.ExpectCommand("AT+MSSLCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPOPEN")
+      .ThenUrc("+MIPOPEN: 0,753\r\n")
+      .Respond("OK\r\n");
+
+  auto result = hal_->TcpConnect("example.com", 443, true);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kTlsHandshakeFailed);
+  // The module's own code survives, so a caller that knows 753 can still see it.
+  EXPECT_EQ(result.error().native, 753);
+}
+
+// The same code on a plaintext socket is not a handshake, and is left as the
+// connect failure it is.
+TEST_F(Ml307HalTest, APlaintextSocketKeepsTheModulesConnectFailure) {
+  channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPOPEN")
+      .ThenUrc("+MIPOPEN: 0,753\r\n")
+      .Respond("OK\r\n");
+
+  auto result = hal_->TcpConnect("example.com", 80);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kConnectFailed);
+  EXPECT_EQ(result.error().native, 753);
+}
+
+// The second code this firmware was observed answering a failed handshake with,
+// on a different host. Both are in the HAL's list for the same reason: each was
+// seen on a TLS socket that opened with code 0 on the same host and port once
+// auth was dropped to 0 and nothing else about the socket changed.
+TEST_F(Ml307HalTest, ASecondHandshakeCodeIsAlsoNamed) {
+  channel_.ExpectCommand("AT+MSSLCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPOPEN")
+      .ThenUrc("+MIPOPEN: 0,762\r\n")
+      .Respond("OK\r\n");
+
+  auto result = hal_->TcpConnect("www.baidu.com", 443, true);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kTlsHandshakeFailed);
+  EXPECT_EQ(result.error().native, 762);
+}
+
+// Why the two above are a list and not a range: nothing observed here covers the
+// numbering around them, so a code this library has never seen keeps the
+// module's own meaning rather than being folded into a diagnosis it did not make.
+TEST_F(Ml307HalTest, AnUnseenCodeOnATlsSocketIsLeftAlone) {
+  channel_.ExpectCommand("AT+MSSLCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
+  channel_.ExpectCommand("AT+MIPOPEN")
+      .ThenUrc("+MIPOPEN: 0,731\r\n")
+      .Respond("OK\r\n");
+
+  auto result = hal_->TcpConnect("example.com", 443, true);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, NetworkErrc::kConnectFailed);
+  EXPECT_EQ(result.error().native, 731);
 }
 
 // The module keeps its own view of which cids are in use, and it outlives this
@@ -466,7 +765,8 @@ TEST_F(Ml307HalTest, TcpConnectReportsWhenEveryConnectionIdIsHeld) {
 }
 
 // A refused TLS handshake is not a busy slot, and retrying it would burn every
-// remaining socket on a host that will never succeed.
+// remaining socket on a host that will never succeed. What the refusal is called
+// is the other test's subject; this one is only about not trying again.
 TEST_F(Ml307HalTest, TcpConnectDoesNotRetryAGenuineConnectFailure) {
   channel_.ExpectCommand("AT+MIPCFG").Respond("OK\r\n");
   channel_.ExpectCommand("AT+MIPOPEN")
@@ -475,7 +775,6 @@ TEST_F(Ml307HalTest, TcpConnectDoesNotRetryAGenuineConnectFailure) {
 
   auto result = hal_->TcpConnect("example.com", 443, true);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code, NetworkErrc::kConnectFailed);
   EXPECT_EQ(result.error().native, 753);
 
   int opens = 0;

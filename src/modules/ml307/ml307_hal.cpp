@@ -23,6 +23,123 @@ namespace {
 constexpr auto kDefaultTimeout = std::chrono::milliseconds(5000);
 constexpr auto kLongTimeout = std::chrono::milliseconds(30000);
 
+// How long to wait for an open to be answered. The module reports the result as
+// a "+MIPOPEN: <id>,<code>" that arrives once it has finished, and for a TLS
+// socket that means after a handshake it was given AT+MSSLCFG="negotime" seconds
+// to complete. Waiting less than that would abandon a handshake still in
+// progress and report a timeout for a socket that then opens - on a cid the pool
+// has already handed back, so the wait has to cover the budget the module was
+// given plus the overhead of the command itself. A plaintext socket was told
+// nothing, so it keeps the plain budget.
+std::chrono::milliseconds OpenTimeout(bool ssl, const TlsConfig& config) {
+  return ssl ? kLongTimeout + config.handshake_timeout : kLongTimeout;
+}
+
+// AT+MSSLCFG=? reports "negotime",(0-5),(10-300): seconds, and the bounds are
+// the module's, not a preference. A config outside them cannot be written, and
+// rounding it into range would hand the caller a timeout they did not ask for
+// on the one operation where waiting the wrong length is indistinguishable from
+// a failure.
+constexpr auto kMinHandshakeTimeout = std::chrono::seconds(10);
+constexpr auto kMaxHandshakeTimeout = std::chrono::seconds(300);
+
+// Whether the config carries anything the caller would expect to be used in a
+// handshake. Checked separately from SslAuthMode because a plaintext socket
+// validates nothing else: its other fields describe a handshake it will not do,
+// but certificate material is a guarantee the caller asked for and is about to
+// silently not get.
+bool HasCertificateMaterial(const TlsConfig& config) {
+  return !config.ca_cert.empty() || !config.client_cert.empty() ||
+         !config.client_key.empty();
+}
+
+// The auth mode AT+MSSLCFG="auth" wants, or the error naming what this module
+// cannot express. Every rejection here is a field the caller set and would
+// otherwise be dropped, and each is a guarantee: a connection that comes up
+// without one is weaker than the one that was asked for.
+Result<int> SslAuthMode(const TlsConfig& config) {
+  if (HasCertificateMaterial(config) || !config.alpn_protocols.empty()) {
+    // AT+MSSLCFG="cert" takes a certificate the module already holds as a file;
+    // loading one means writing it into the module's filesystem over AT+MFS*,
+    // which this library has no path for. ALPN has no command at all.
+    return std::unexpected(NetworkError(
+        NetworkErrc::kNotSupported, 0,
+        "TLS certificates and ALPN cannot be set from this library: the module "
+        "takes a certificate file it already holds (AT+MSSLCFG=\"cert\") and has "
+        "no ALPN setting"));
+  }
+  if (config.verify_certificate != config.verify_hostname) {
+    // auth 0 verifies nothing and auth 1 verifies the chain and the hostname
+    // together. There is no mode that separates them, so either half of the
+    // pair on its own would have to be answered with something other than what
+    // was asked: a connection trusted on a hostname with no chain check, or one
+    // that skipped a check the caller kept. Both are guesses about which
+    // guarantee mattered, made on the caller's behalf.
+    return std::unexpected(NetworkError(
+        NetworkErrc::kNotSupported, 0,
+        "AT+MSSLCFG=\"auth\" verifies the certificate chain and the hostname as "
+        "one setting, so verify_certificate and verify_hostname have to agree"));
+  }
+  if (config.handshake_timeout < kMinHandshakeTimeout ||
+      config.handshake_timeout > kMaxHandshakeTimeout) {
+    char context[128];
+    std::snprintf(context, sizeof(context),
+                  "TlsConfig.handshake_timeout of %lld s is outside the 10-300 s "
+                  "AT+MSSLCFG=\"negotime\" accepts",
+                  static_cast<long long>(config.handshake_timeout.count()));
+    return std::unexpected(
+        NetworkError(NetworkErrc::kInvalidArgument, 0, context));
+  }
+  // auth 0 asks the module for nothing; auth 1 asks it to verify the server
+  // against a certificate authority it holds. Which authorities this firmware
+  // ships is not something the library can see, so a module with none fails the
+  // handshake rather than failing here - which is why TlsConfig's own default is
+  // 0, and why asking for 1 on a module that holds none is reported as the
+  // handshake failure it is instead of being answered silently with 0.
+  return config.verify_certificate ? 1 : 0;
+}
+
+// The codes this module answers with when a TLS handshake it was asked to
+// perform does not complete: 753 against example.com, 762 against
+// www.baidu.com on ML307R-DL-MBRH0S01. Neither is read from a document, and the
+// numbering either side of them is not covered by anything observed here, so
+// this is a list rather than a range - a code this library has never seen stays
+// the connection failure it was reported as.
+//
+// What the two have in common beyond both being seen on a TLS socket is a
+// controlled observation: on each host, at the same port with everything else
+// about the socket left alone, the open answered with code 0 as soon as
+// AT+MSSLCFG="auth" was dropped to 0. Nothing about the socket changed except
+// the negotiation the module was asked to perform, which is what makes the code
+// a report about the handshake rather than about reaching the host.
+bool IsTlsHandshakeFailure(int code) { return code == 753 || code == 762; }
+
+// AT+MIPOPEN performs the handshake on a socket that was switched to TLS, so a
+// refusal there is the handshake failing rather than the host being
+// unreachable - and the two want different things from the caller. This matters
+// most for the case the module cannot distinguish on its own: this firmware
+// ships no certificate authority, and AT+MSSLCFG="cert" reads back
+// "NULL","NULL","NULL" until one is installed, so a socket that asked for
+// verification has nothing to verify with and fails here. Reported as
+// "connection failed", that sends the caller looking at the network instead of
+// at the verification they asked for.
+NetworkError DescribeOpenFailure(bool ssl, const NetworkError& error) {
+  if (ssl && IsTlsHandshakeFailure(error.native)) {
+    // What is established is that the module refused a socket it had been told
+    // to speak TLS on, this way. The code is the module's and it does not say
+    // which part of the negotiation failed - a firmware with no certificate
+    // authority answers it when asked to verify, and so may one that cannot
+    // reach the host - so the message says what happened and names the cause
+    // this library has seen rather than asserting it was that one.
+    return NetworkError(NetworkErrc::kTlsHandshakeFailed, error.native,
+                        error.context +
+                            " - the module refused the TLS connection; this is "
+                            "what a firmware holding no certificate authority "
+                            "answers when asked to verify");
+  }
+  return error;
+}
+
 }  // namespace
 
 Ml307Hal::~Ml307Hal() {
@@ -261,12 +378,13 @@ Result<> Ml307Hal::ExitSleep() {
 
 Result<int> Ml307Hal::TcpConnect(std::string_view host,
                                  uint16_t port,
-                                 bool ssl) {
+                                 bool ssl,
+                                 const TlsConfig& config) {
   if (!channel_) {
     return std::unexpected(
         NetworkError(NetworkErrc::kNotInitialized, 0, "channel not set"));
   }
-  return OpenSocket("TCP", host, port, ssl);
+  return OpenSocket("TCP", host, port, ssl, config);
 }
 
 Result<> Ml307Hal::TcpClose(int connect_id) {
@@ -286,7 +404,7 @@ Result<int> Ml307Hal::UdpOpen(std::string_view host, uint16_t port) {
   }
   // UDP is never TLS through this API, and the reference clears the ssl flag for
   // its udp sockets too, so each socket starts from a known state.
-  return OpenSocket("UDP", host, port, false);
+  return OpenSocket("UDP", host, port, false, TlsConfig{});
 }
 
 Result<> Ml307Hal::UdpClose(int connect_id) {
@@ -428,7 +546,8 @@ bool IsConnectionIdBusy(const NetworkError& error) {
 Result<int> Ml307Hal::OpenSocket(std::string_view type,
                                  std::string_view host,
                                  uint16_t port,
-                                 bool ssl) {
+                                 bool ssl,
+                                 const TlsConfig& config) {
   int first = 0;
   while (first < kMaxConnections) {
     int id = AllocateConnectionId(first);
@@ -452,12 +571,13 @@ Result<int> Ml307Hal::OpenSocket(std::string_view type,
       continue;
     }
 
-    if (auto r = ConfigureSsl(id, ssl); !r) return release(r.error());
+    if (auto r = ConfigureSsl(id, ssl, config); !r) return release(r.error());
     if (auto r = ConfigureEncoding(id); !r) return release(r.error());
 
-    if (auto opened = OpenOnId(id, type, host, port); !opened) {
+    if (auto opened = OpenOnId(id, type, host, port, OpenTimeout(ssl, config));
+        !opened) {
       if (!IsConnectionIdBusy(opened.error())) {
-        return release(opened.error());
+        return release(DescribeOpenFailure(ssl, opened.error()));
       }
       // The cid went busy between the state check and the open. Hand it back and
       // resume the search past it, so the next attempt cannot land on the slot
@@ -481,7 +601,8 @@ Result<int> Ml307Hal::OpenSocket(std::string_view type,
 Result<> Ml307Hal::OpenOnId(int id,
                             std::string_view type,
                             std::string_view host,
-                            uint16_t port) {
+                            uint16_t port,
+                            std::chrono::milliseconds timeout) {
   // The socket type is a quoted string and the timeout slot is left empty; the
   // positional form (MIPOPEN=<id>,0,...) answers "+CME ERROR: 50" on ML307R-DL
   // even though AT+MIPOPEN=? advertises a numeric field there.
@@ -492,7 +613,7 @@ Result<> Ml307Hal::OpenOnId(int id,
                 static_cast<unsigned>(port));
 
   ArmOpenWait(id);
-  auto r = channel_->SendCommand(cmd, kLongTimeout);
+  auto r = channel_->SendCommand(cmd, timeout);
   if (!r) return std::unexpected(r.error().ToNetworkError());
 
   // The module does not always put its OK before the result: "+MIPOPEN: <id>,0"
@@ -507,7 +628,7 @@ Result<> Ml307Hal::OpenOnId(int id,
     RecordOpenResult(StripKeyPrefix(line));
   }
 
-  return WaitForOpenResult(id, kLongTimeout);
+  return WaitForOpenResult(id, timeout);
 }
 
 Result<bool> Ml307Hal::QuerySocketActive(int id) {
@@ -584,28 +705,81 @@ Result<bool> Ml307Hal::EnsureSocketFree(int id) {
   return false;
 }
 
-Result<> Ml307Hal::ConfigureSsl(int id, bool enable) {
+Result<> Ml307Hal::ConfigureSsl(int id, bool enable, const TlsConfig& config) {
   // TLS is not an AT+MIPOPEN argument on this module; it is a per-cid setting
-  // applied beforehand. Enabling also requires the auth mode to be cleared
-  // first, since the default asks for a client certificate we do not have.
+  // applied beforehand, along with the SSL context that carries the client's
+  // verification settings.
   //
   // Note that "SSL" is not a socket type here - AT+MIPOPEN with it answers
   // "+CME ERROR: 50" - and the handshake happens during MIPOPEN, so a server
   // this firmware cannot negotiate with fails there with "+MIPOPEN: <id>,753"
-  // rather than at the first send. The code is host-specific, not
-  // configuration-specific: example.com returns 753 for every combination of
-  // timeout, access mode and ordering tried against ML307R-DL-MBRH0S01, while
-  // hosts with more conservative TLS settings answer 0. Raising 753 to the
-  // caller as an opaque "connection failed" hides which of the two it was, so
-  // the module's own code is preserved in `native`.
-  if (enable) {
-    auto auth = channel_->SendCommand("AT+MSSLCFG=\"auth\",0,0", kDefaultTimeout);
-    if (!auth) return std::unexpected(auth.error().ToNetworkError());
+  // rather than at the first send. Which code comes back depends on the
+  // configuration as well as the host: the same host and port answer 0 the
+  // moment AT+MSSLCFG="auth" drops to 0, and this firmware - which holds no
+  // certificate authority at all - fails that way on every host once a socket
+  // asks it to verify. Raising the code to the caller as an opaque "connection
+  // failed" hides the difference, so it is named when it is one this library has
+  // observed a handshake failure with, and preserved in `native` either way.
+  //
+  // Every refusal below happens before the first command is sent, so a config
+  // this module cannot express costs no AT traffic. It does not leave the cid
+  // untouched: by the time this runs the socket has already been checked and, if
+  // it was held, closed - and a refused config releases the cid into the
+  // quarantine every other failed open goes through.
+  if (!enable) {
+    if (HasCertificateMaterial(config)) {
+      return std::unexpected(NetworkError(
+          NetworkErrc::kNotSupported, 0,
+          "a TlsConfig with certificate material was given to a plaintext "
+          "socket; the connection would be unauthenticated, so the material is "
+          "refused rather than dropped"));
+    }
+    // The flag is cleared rather than left alone, because a cid that carried
+    // TLS last time must not come back up in plaintext with SSL still on.
+    char cmd[64];
+    std::snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"ssl\",%d,0,0", id);
+    auto off = channel_->SendCommand(cmd, kDefaultTimeout);
+    if (!off) return std::unexpected(off.error().ToNetworkError());
+    return {};
   }
 
+  auto auth = SslAuthMode(config);
+  if (!auth) return std::unexpected(auth.error());
+
+  // The module keeps its SSL settings in one of six numbered contexts and names
+  // the context when the socket is opened, not when the settings are written
+  // (+MSSLCFG: "auth",(0-5),(0-2) / +MIPCFG: "ssl",(0-5),(0-1),(0-5)). The cid
+  // is used as the context, which is free: this module reports six of each, and
+  // AllocateConnectionId keeps cids in that same 0-5 range.
+  //
+  // The reason to give each socket its own context is that the three settings
+  // above are written per cid and are not one atomic act, so with a single
+  // shared context a second connection's writes could land between the first
+  // one's write and the AT+MIPOPEN that reads them - the first socket would then
+  // negotiate with settings its caller never asked for. Keyed by cid, every
+  // write a socket makes is a write only its own open reads. What was not
+  // established here is whether the module re-reads the context after a
+  // handshake; nothing in this library relies on either answer.
+  //
+  // Rewritten on every open rather than cached against the cid. Two commands on
+  // the path of a connection that is about to do a TLS handshake is not worth a
+  // cache whose entries can disagree with the module - a context keeps its
+  // settings across sockets, and the module is not the only thing that outlives
+  // this process.
+  char auth_cmd[64];
+  std::snprintf(auth_cmd, sizeof(auth_cmd), "AT+MSSLCFG=\"auth\",%d,%d", id,
+                *auth);
+  auto auth_sent = channel_->SendCommand(auth_cmd, kDefaultTimeout);
+  if (!auth_sent) return std::unexpected(auth_sent.error().ToNetworkError());
+
+  char time_cmd[64];
+  std::snprintf(time_cmd, sizeof(time_cmd), "AT+MSSLCFG=\"negotime\",%d,%lld",
+                id, static_cast<long long>(config.handshake_timeout.count()));
+  auto time_sent = channel_->SendCommand(time_cmd, kDefaultTimeout);
+  if (!time_sent) return std::unexpected(time_sent.error().ToNetworkError());
+
   char cmd[64];
-  std::snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"ssl\",%d,%d,0", id,
-                enable ? 1 : 0);
+  std::snprintf(cmd, sizeof(cmd), "AT+MIPCFG=\"ssl\",%d,1,%d", id, id);
   auto r = channel_->SendCommand(cmd, kDefaultTimeout);
   if (!r) return std::unexpected(r.error().ToNetworkError());
   return {};

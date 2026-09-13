@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "esp_modem_link/callbacks.h"
+#include "esp_modem_link/config_types.h"
 #include "esp_modem_link/network_error.h"
 
 namespace esp_modem_link {
@@ -51,6 +52,18 @@ class WebSocketClient {
   virtual ~WebSocketClient() = default;
 
   virtual void SetHeader(std::string_view key, std::string_view value) = 0;
+
+  // Settings for the handshake under wss://. Unlike MQTT, this client reads the
+  // caller's intent from the URL - ws:// against wss:// - so this configures a
+  // TLS connection that the scheme has already asked for rather than switching
+  // one on. It is also unlike HTTP, which can follow a redirect across the
+  // boundary and therefore re-reads the config per request: a WebSocket
+  // connection is opened by a single upgrade whose URL is known in advance.
+  //
+  // Read when the connection is established, so a change applies from the next
+  // Connect() and not to an open socket, which is already past its handshake.
+  // Ignored entirely by a ws:// connection.
+  virtual void SetTlsConfig(const TlsConfig& config) = 0;
 
   // Off unless `enabled` is set, and off at a zero interval whatever it says: a
   // ping every zero seconds is a loop rather than a heartbeat. The timeout is

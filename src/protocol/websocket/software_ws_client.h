@@ -23,11 +23,11 @@
 namespace esp_modem_link::protocol {
 
 // The scheme is read from the URL, so an address starting wss:// is all the
-// client needs to ask for a socket under TLS. WebSocketClient has nowhere to
-// put a TlsConfig, which is why this takes one flag rather than the HTTP and
-// MQTT engines' (tls, config) pair.
+// client needs to ask for a socket under TLS; the config alongside the flag is
+// SetTlsConfig()'s, and is meaningless for a ws:// connection.
 using WsTransportFactory =
-    std::function<Result<std::unique_ptr<TcpClient>>(bool tls)>;
+    std::function<Result<std::unique_ptr<TcpClient>>(bool tls,
+                                                     const TlsConfig& config)>;
 
 // ws:// and wss:// resolved through the same URL splitter the HTTP engine uses,
 // with the scheme rewritten to its HTTP equivalent. A WebSocket handshake is an
@@ -61,12 +61,23 @@ class SoftwareWsClient : public WebSocketClient {
   // The handshake wait is a constructor argument rather than a setter because
   // WebSocketClient has no SetTimeout, and a caller only ever wants to shorten
   // it.
+  //
+  // This is the wait for the HTTP upgrade, and it is not TlsConfig's
+  // handshake_timeout, which is the budget the module is given to negotiate TLS
+  // inside the open. The two run in sequence for a wss:// connection - the
+  // transport is opened, and only then does the upgrade request go out - so a
+  // caller who wants more room for the whole act has to raise both: this one,
+  // and the TlsConfig the transport is handed. They are separate because they
+  // measure different things and a plaintext ws:// connection has only the
+  // first.
   explicit SoftwareWsClient(
       WsTransportFactory factory,
       std::chrono::milliseconds handshake_timeout = std::chrono::seconds(10));
   ~SoftwareWsClient() override;
 
   void SetHeader(std::string_view key, std::string_view value) override;
+
+  void SetTlsConfig(const TlsConfig& config) override;
 
   void SetHeartbeat(const HeartbeatConfig& config) override;
 
@@ -186,6 +197,7 @@ class SoftwareWsClient : public WebSocketClient {
   std::string rx_buffer_;
 
   std::vector<std::pair<std::string, std::string>> headers_;
+  TlsConfig tls_config_;
   std::string url_;
   bool user_closed_ = false;
 

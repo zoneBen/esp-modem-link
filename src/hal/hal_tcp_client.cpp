@@ -4,8 +4,8 @@
 
 namespace esp_modem_link::hal {
 
-HalTcpClient::HalTcpClient(IModuleHal& hal, bool ssl)
-    : hal_(hal), ssl_(ssl) {}
+HalTcpClient::HalTcpClient(IModuleHal& hal, bool ssl, const TlsConfig& config)
+    : hal_(hal), ssl_(ssl), tls_config_(config) {}
 
 HalTcpClient::~HalTcpClient() {
   if (connected_) {
@@ -25,7 +25,7 @@ Result<> HalTcpClient::Connect(std::string_view host, uint16_t port) {
         NetworkError(NetworkErrc::kAlreadyConnected, 0, "already connected"));
   }
 
-  auto result = hal_.TcpConnect(host, port, ssl_);
+  auto result = hal_.TcpConnect(host, port, ssl_, tls_config_);
   if (!result.has_value()) {
     return std::unexpected(result.error());
   }

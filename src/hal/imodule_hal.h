@@ -75,9 +75,17 @@ class IModuleHal {
   virtual Result<> SetFlightMode(bool enable) = 0;
 
   // TCP client (required for all modules with data capability)
+  //
+  // `config` describes the handshake when `ssl` is set and is ignored otherwise,
+  // except that a module must refuse certificate material handed to a plaintext
+  // socket rather than let the connection come up silently unauthenticated. Not
+  // every field maps onto every module: an honest HAL reports the ones its AT
+  // commands cannot express instead of dropping them, so a caller that asked for
+  // verification finds out before the socket is open.
   virtual Result<int> TcpConnect(std::string_view host,
                                  uint16_t port,
-                                 bool ssl = false) = 0;
+                                 bool ssl = false,
+                                 const TlsConfig& config = {}) = 0;
   virtual Result<> TcpClose(int connect_id) = 0;
   virtual Result<int> TcpSend(int connect_id,
                               const void* data,

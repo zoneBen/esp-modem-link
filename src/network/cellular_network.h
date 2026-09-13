@@ -26,9 +26,15 @@ class CellularNetwork : public NetworkInterface {
 
  private:
   // The transport the software protocol engines run on: a raw socket from the
-  // HAL, opened for TLS when the engine says it needs it. Shared by every
-  // engine so that "this module has no TLS" is answered in one place.
-  Result<std::unique_ptr<TcpClient>> OpenTransport(bool tls);
+  // HAL, opened for TLS when the engine says it needs it and configured from the
+  // caller's TlsConfig when it is. Shared by every engine so that "this module
+  // has no TLS" is answered in one place.
+  //
+  // The engine passes the config it was given rather than this class holding
+  // one: an engine outlives the connections it makes, and SetTlsConfig between
+  // two of them is meant to apply to the second.
+  Result<std::unique_ptr<TcpClient>> OpenTransport(bool tls,
+                                                   const TlsConfig& config);
 
   hal::IModuleHal& hal_;
 };

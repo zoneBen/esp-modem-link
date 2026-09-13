@@ -134,6 +134,11 @@ void SoftwareWsClient::SetHeader(std::string_view key, std::string_view value) {
   headers_.emplace_back(std::string(key), std::string(value));
 }
 
+void SoftwareWsClient::SetTlsConfig(const TlsConfig& config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  tls_config_ = config;
+}
+
 void SoftwareWsClient::SetHeartbeat(const HeartbeatConfig& config) {
   std::lock_guard<std::mutex> lock(mutex_);
   heartbeat_interval_ = config.interval;
@@ -213,6 +218,7 @@ Result<> SoftwareWsClient::Establish(std::string_view url) {
   }
 
   std::string key;
+  TlsConfig tls_config;
   std::vector<std::pair<std::string, std::string>> headers;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -221,6 +227,11 @@ Result<> SoftwareWsClient::Establish(std::string_view url) {
                                           "already connected"));
     }
     headers = headers_;
+    // Read here, with the headers and for the same reason: the connection is
+    // built from what was set before Connect(), so a SetTlsConfig arriving
+    // while the handshake is in flight applies to the connection after this one
+    // rather than to a socket whose handshake has already started.
+    tls_config = tls_config_;
     // A caller that set the key itself is taken at its word, and the accept
     // value is then checked against the key that actually went out.
     key = HeaderValue(headers, "Sec-WebSocket-Key");
@@ -237,7 +248,12 @@ Result<> SoftwareWsClient::Establish(std::string_view url) {
     state_ = State::kHandshaking;
   }
 
-  auto created = factory_(parsed->tls);
+  // Only for a wss:// connection, and for the same reason the HTTP engine gates
+  // it: the config describes the handshakes this client performs, and a ws://
+  // socket does not perform one. Handing its certificate material to a plaintext
+  // socket would be refused by an honest HAL, failing a connection the caller
+  // never asked to be verified.
+  auto created = factory_(parsed->tls, parsed->tls ? tls_config : TlsConfig{});
   if (!created.has_value()) {
     std::lock_guard<std::mutex> lock(mutex_);
     state_ = State::kDisconnected;

@@ -54,6 +54,11 @@ void SoftwareHttpClient::SetMaxRedirects(int max) {
 }
 
 void SoftwareHttpClient::SetTlsConfig(const TlsConfig& config) {
+  // Under the same lock EnsureConnected reads it with. A TlsConfig is four
+  // strings, so a setter running against an in-flight request is a torn read
+  // rather than a stale one - and the WebSocket and MQTT clients lock here for
+  // the same reason.
+  std::lock_guard<std::mutex> lock(mutex_);
   tls_ = config;
 }
 
@@ -78,7 +83,22 @@ Result<> SoftwareHttpClient::EnsureConnected(const ParsedUrl& url) {
 
   DropTransport();
 
-  auto created = factory_(url.tls, tls_);
+  // Copied under the lock so the config handed to the factory cannot be a value
+  // a SetTlsConfig is halfway through writing.
+  TlsConfig tls_config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tls_config = tls_;
+  }
+
+  // The held config describes the TLS connections this client makes, so it is
+  // not passed on for a plaintext one. A socket that will not handshake has no
+  // use for verification settings, and an honest HAL refuses certificate
+  // material handed to one rather than let it come up unauthenticated - so
+  // forwarding it here would turn a config set for a client's https:// requests
+  // into a failure on the next http:// request, which is not what the caller
+  // said by setting it.
+  auto created = factory_(url.tls, url.tls ? tls_config : TlsConfig{});
   if (!created) {
     return std::unexpected(created.error());
   }

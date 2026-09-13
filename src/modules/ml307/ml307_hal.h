@@ -49,7 +49,8 @@ class Ml307Hal : public hal::IModuleHal {
   // TCP
   Result<int> TcpConnect(std::string_view host,
                          uint16_t port,
-                         bool ssl = false) override;
+                         bool ssl = false,
+                         const TlsConfig& config = {}) override;
   Result<> TcpClose(int connect_id) override;
   Result<int> TcpSend(int connect_id, const void* data, size_t len) override;
 
@@ -79,14 +80,21 @@ class Ml307Hal : public hal::IModuleHal {
   Result<int> OpenSocket(std::string_view type,
                          std::string_view host,
                          uint16_t port,
-                         bool ssl);
+                         bool ssl,
+                         const TlsConfig& config);
 
   // The AT+MIPOPEN itself, including the asynchronous result rendezvous. Split
   // out of TcpConnect so the retry above can reuse it unchanged.
+  //
+  // `timeout` bounds both the command and the wait for the "+MIPOPEN: <id>,<code>"
+  // that carries the outcome, which for a TLS socket is not reported until the
+  // handshake is over - so the caller derives it from the negotiation budget the
+  // module was given rather than passing a constant.
   Result<> OpenOnId(int id,
                     std::string_view type,
                     std::string_view host,
-                    uint16_t port);
+                    uint16_t port,
+                    std::chrono::milliseconds timeout);
 
   // Asks the module whether this cid is in use. The pool above tracks what this
   // process opened; the module's view also covers sockets left behind by an
@@ -119,7 +127,7 @@ class Ml307Hal : public hal::IModuleHal {
 
   // Socket setup steps shared by TCP and UDP. Ordered per the module's own
   // sequence: TLS switch first, then payload encoding, then MIPOPEN.
-  Result<> ConfigureSsl(int id, bool enable);
+  Result<> ConfigureSsl(int id, bool enable, const TlsConfig& config);
   Result<> ConfigureEncoding(int id);
 
   // AT+MIPOPEN answers OK as soon as the request is accepted; the module then
