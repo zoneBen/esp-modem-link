@@ -534,8 +534,12 @@ Result<HttpResponse> SoftwareHttpClient::AwaitHeaders() {
   // before any of the body has been consumed.
   std::unique_lock<std::mutex> lock(mutex_);
   cv_.wait_for(lock, timeout_, [this] {
-    return parser_.GetState() != HttpParser::State::kStatusLine &&
-           parser_.GetState() != HttpParser::State::kHeaders ||
+    // The parentheses are what the operators already did - headers are done
+    // when the parser has left both the status line and the header block - and
+    // saying so keeps -Werror=parentheses quiet, which is on in the ESP-IDF
+    // build and would otherwise stop the library from compiling for the target.
+    return (parser_.GetState() != HttpParser::State::kStatusLine &&
+            parser_.GetState() != HttpParser::State::kHeaders) ||
            parse_failed_ || closed_;
   });
 
