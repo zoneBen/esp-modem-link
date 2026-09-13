@@ -106,6 +106,53 @@ class CellularDevice {
   static Result<std::unique_ptr<CellularDevice>> Assemble(
       std::unique_ptr<Impl> impl,
       std::unique_ptr<hal::IModuleHal> hal);
+
+  // Which module is on the other end of a channel that is already open.
+  using IdentifyFn = std::function<Result<std::unique_ptr<hal::IModuleHal>>(
+      at_channel::IAtChannel& channel)>;
+
+  // Body shared by all four entry points: settle the wire rate, identify the
+  // module, settle the rate again, assemble. Written once rather than four
+  // times because "every entry point aligns" has to be a structural fact - the
+  // rate negotiation used to live inside the HAL, where three of the four
+  // entry points never reached it.
+  static Result<std::unique_ptr<CellularDevice>> BringUp(
+      std::unique_ptr<Impl> impl,
+      const IdentifyFn& identify);
+
+  // Stage one of the rate negotiation: find a rate the module answers at,
+  // before anything has tried to identify it. Returns the rate the caller
+  // opened the port at, which is what stage two asks the module for.
+  //
+  // Finding nothing is not a failure to start - the firmware may not implement
+  // AT+IPR? at all, and the caller may well have asked for the right rate - so
+  // this does not fail, and leaves the channel where the caller put it. The
+  // identification that follows is what decides whether the device is usable.
+  static int AlignBeforeIdentify(at_channel::IAtChannel& channel);
+
+  // Stage two: ask the module to come to `requested`, now that identification
+  // has proved what is on the other end.
+  //
+  // AT+IPR=<rate> is persistent - a module keeps it across a power cycle - so on
+  // the Detect entry points it is not written until AT+CGMR has identified the
+  // module as one this library knows. A failed identification therefore never
+  // reconfigures anything.
+  //
+  // The Create entry points do not identify, and cannot: the caller naming a
+  // ModuleType IS the identification, and CreateModule builds a HAL from it
+  // without sending a byte. So a Create against a device that is not the type
+  // named will have its rate written, on the caller's assertion. That is the
+  // meaning of the API - it is why the type is a required argument rather than
+  // guessed - but it means the split above is a property of Detect, not of this
+  // function. A caller who is not sure what is on the port wants Detect.
+  //
+  // A failure here is propagated: the one alignment error worth reporting is a
+  // module that moved to a new rate and a channel that could not follow - or a
+  // module that neither took the new rate nor went back to the old one - which
+  // leaves nothing able to talk and would otherwise surface as an unexplained
+  // timeout in the first command of initialization.
+  static Result<> AlignAfterIdentify(at_channel::IAtChannel& channel,
+                                     int requested);
 };
 
 }  // namespace esp_modem_link

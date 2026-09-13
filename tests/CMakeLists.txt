@@ -36,6 +36,7 @@ if(NOT googletest_POPULATED)
       test_response_parser.cpp
       test_urc_dispatcher.cpp
       test_at_uart.cpp
+      test_baud_alignment.cpp
       test_module_registry.cpp
       test_hal_tcp_client.cpp
       test_hal_udp_client.cpp

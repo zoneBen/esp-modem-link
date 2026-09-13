@@ -15,58 +15,13 @@ namespace esp_modem_link::modules::ml307 {
 using at_channel::IAtChannel;
 using at_parser::ParseInt;
 using at_parser::SplitCsv;
+using at_parser::StripKeyPrefix;
 using at_parser::StripQuotes;
 
 namespace {
 
 constexpr auto kDefaultTimeout = std::chrono::milliseconds(5000);
 constexpr auto kLongTimeout = std::chrono::milliseconds(30000);
-
-// Where the module is if nothing has ever set its rate: the factory setting, and
-// the rate the library's own UartConfig default opens the port at.
-constexpr int kDefaultBaudRate = 115200;
-
-// Strip the "+KEY:" prefix from a response line, returning just the value
-// part. AT responses look like "+CSQ: 23,99" and the key must not be fed to
-// field parsers, or every field shifts by one.
-std::string_view StripKeyPrefix(std::string_view line) {
-  auto colon = line.find(':');
-  if (colon == std::string_view::npos) return line;
-  auto value = line.substr(colon + 1);
-  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-    value.remove_prefix(1);
-  }
-  while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-    value.remove_suffix(1);
-  }
-  return value;
-}
-
-// "+IPR: 921600" -> 921600. Nothing means the module did not say, which every
-// caller treats as "cannot act on this" rather than as a rate of zero.
-std::optional<int> ParseRate(std::string_view line) {
-  auto value = ParseInt(StripKeyPrefix(line));
-  if (!value) return std::nullopt;
-  return *value;
-}
-
-// AT+IPR=? answers with two tuples: the rates the module can be set to, then
-// the rates it will accept. The match is on whole numbers, because 115200 is a
-// prefix of 1152000 and a bare substring search would accept a rate the module
-// turns out to reject - and a rejected rate leaves the link silent.
-bool ListsRate(std::string_view supported, int rate) {
-  const std::string needle = std::to_string(rate);
-  for (size_t pos = supported.find(needle); pos != std::string_view::npos;
-       pos = supported.find(needle, pos + needle.size())) {
-    const bool starts =
-        pos == 0 || !std::isdigit(static_cast<unsigned char>(supported[pos - 1]));
-    const size_t after = pos + needle.size();
-    const bool ends = after >= supported.size() ||
-                      !std::isdigit(static_cast<unsigned char>(supported[after]));
-    if (starts && ends) return true;
-  }
-  return false;
-}
 
 }  // namespace
 
@@ -104,12 +59,10 @@ const ModuleCapabilities& Ml307Hal::GetCapabilities() const {
 Result<> Ml307Hal::Initialize(IAtChannel& channel) {
   channel_ = &channel;
 
-  // Settle the wire rate before anything else is sent. A module listening at a
-  // different rate does not answer at all - it does not report a mismatch - so
-  // every command below would fail for a reason that has nothing to do with it.
-  if (auto aligned = AlignBaudRate(); !aligned) return aligned;
-
-  // Basic init sequence
+  // Whatever the caller had to do to get a reply out of the module - the wire
+  // rate, in practice - has already been done: the channel handed here is one
+  // the module answers on, because the caller could not have identified it
+  // otherwise. See at_channel::FindModuleBaudRate.
   auto r = channel.SendCommand("ATE0", kDefaultTimeout);
   if (!r) return std::unexpected(r.error().ToNetworkError());
 
@@ -122,96 +75,6 @@ Result<> Ml307Hal::Initialize(IAtChannel& channel) {
   // earlier run or a module reset left in a different state.
   RegisterUrcHandlers();
 
-  return {};
-}
-
-Result<> Ml307Hal::AlignBaudRate() {
-  if (!channel_) {
-    return std::unexpected(
-        NetworkError(NetworkErrc::kNotInitialized, 0, "channel not set"));
-  }
-
-  const int desired = channel_->GetBaudRate();
-  if (desired <= 0) return {};
-
-  // The query only reaches the module if both ends are on the same rate, and the
-  // channel was opened at the requested one - which is not necessarily where the
-  // module is. So the query is placed at each rate the module plausibly sits at
-  // until one answers. The factory setting covers a module that has never been
-  // reconfigured; the module's maximum covers one an earlier session moved it to,
-  // which it keeps until it is told otherwise - across port closes and process
-  // restarts, so a module found there is the normal outcome of a previous run at
-  // that rate rather than a fault.
-  //
-  // Probing at the requested rate first means a module already there costs
-  // nothing extra, which is the normal case once a rate has been established.
-  std::optional<int> current;
-  std::vector<int> tried;
-  for (const int rate : {desired, kDefaultBaudRate,
-                         GetCapabilities().max_baud_rate}) {
-    if (rate <= 0) continue;
-    if (std::find(tried.begin(), tried.end(), rate) != tried.end()) continue;
-    tried.push_back(rate);
-
-    if (rate != channel_->GetBaudRate()) {
-      // A channel that cannot be moved to this rate could not read an answer
-      // given at it either, so there is nothing to wait for.
-      auto moved = channel_->SetBaudRate(rate);
-      if (!moved) continue;
-    }
-
-    auto line = ReadSingleLineResponse("AT+IPR?", kBaudProbeTimeout);
-    if (!line) continue;
-    current = ParseRate(*line);
-    if (current) break;
-  }
-
-  if (!current) {
-    // Nothing answered at any of them. Put the channel back where the caller set
-    // it and carry on: the firmware may not implement AT+IPR? at all, and a
-    // device whose rate cannot be read is not a device that cannot be used.
-    channel_->SetBaudRate(desired);
-    return {};
-  }
-
-  if (*current == desired) {
-    // Already in line. The channel is left on the rate that answered, which is
-    // the rate the module is on - setting it costs nothing when they agree.
-    channel_->SetBaudRate(desired);
-    return {};
-  }
-
-  // Ask before setting. A rate the module does not accept is a rate that
-  // silences it, which is worse than the slow link the caller was trying to
-  // improve on.
-  auto supported = ReadSingleLineResponse("AT+IPR=?", kBaudProbeTimeout);
-  if (!supported || !ListsRate(*supported, desired)) return {};
-
-  auto set = channel_->SendCommand("AT+IPR=" + std::to_string(desired),
-                                   kDefaultTimeout);
-  if (!set) return {};  // refused; the module is still where it was
-
-  // The module switches on its OK, so from here the two ends only talk again
-  // once the host has followed.
-  if (auto moved = channel_->SetBaudRate(desired); !moved) {
-    return std::unexpected(NetworkError(
-        NetworkErrc::kNotInitialized, 0,
-        "module switched to " + std::to_string(desired) +
-            " baud but the channel could not follow"));
-  }
-
-  for (int attempt = 0; attempt < kBaudProbeAttempts; ++attempt) {
-    auto now_line = ReadSingleLineResponse("AT+IPR?", kBaudProbeTimeout);
-    if (now_line && ParseRate(*now_line) == desired) return {};
-  }
-
-  // Unconfirmed. Both ends are moved back to the rate that was working, as a
-  // pair, before anything else runs: sending the change while both are still at
-  // the new rate, then following with the host, is the same order that got here.
-  // A module that will not go back leaves the link silent either way, which is
-  // no worse than leaving it silent at an unconfirmed rate.
-  channel_->SendCommand("AT+IPR=" + std::to_string(*current), kDefaultTimeout);
-  channel_->SetBaudRate(*current);
   return {};
 }
 

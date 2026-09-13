@@ -42,6 +42,19 @@ std::string_view StripQuotes(std::string_view s) {
   return s;
 }
 
+std::string_view StripKeyPrefix(std::string_view line) {
+  auto colon = line.find(':');
+  if (colon == std::string_view::npos) return line;
+  auto value = line.substr(colon + 1);
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+    value.remove_suffix(1);
+  }
+  return value;
+}
+
 std::optional<int> ParseInt(std::string_view s) {
   if (s.empty()) return std::nullopt;
   int value = 0;

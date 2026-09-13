@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "at_channel/at_uart.h"
+#include "at_channel/baud_alignment.h"
 #include "at_channel/iat_channel.h"
 #include "device/cellular_device_impl.h"
 #include "esp_modem_link/config_types.h"
@@ -63,13 +64,9 @@ Result<std::unique_ptr<CellularDevice>> CellularDevice::Detect(
   }
   impl->at_uart = std::move(*channel);
 
-  auto hal_result =
-      hal::ModuleRegistry::Instance().DetectModule(*impl->at_uart);
-  if (!hal_result) {
-    return std::unexpected(hal_result.error());
-  }
-
-  return Assemble(std::move(impl), std::move(*hal_result));
+  return BringUp(std::move(impl), [](at_channel::IAtChannel& channel) {
+    return hal::ModuleRegistry::Instance().DetectModule(channel);
+  });
 }
 
 Result<std::unique_ptr<CellularDevice>> CellularDevice::Create(
@@ -84,12 +81,9 @@ Result<std::unique_ptr<CellularDevice>> CellularDevice::Create(
   }
   impl->at_uart = std::move(*channel);
 
-  auto hal_result = hal::ModuleRegistry::Instance().CreateModule(type);
-  if (!hal_result) {
-    return std::unexpected(hal_result.error());
-  }
-
-  return Assemble(std::move(impl), std::move(*hal_result));
+  return BringUp(std::move(impl), [type](at_channel::IAtChannel&) {
+    return hal::ModuleRegistry::Instance().CreateModule(type);
+  });
 }
 
 Result<std::unique_ptr<CellularDevice>> CellularDevice::Detect(
@@ -105,13 +99,9 @@ Result<std::unique_ptr<CellularDevice>> CellularDevice::Detect(
   auto impl = std::make_unique<Impl>();
   impl->at_uart = std::move(channel);
 
-  auto hal_result =
-      hal::ModuleRegistry::Instance().DetectModule(*impl->at_uart);
-  if (!hal_result) {
-    return std::unexpected(hal_result.error());
-  }
-
-  return Assemble(std::move(impl), std::move(*hal_result));
+  return BringUp(std::move(impl), [](at_channel::IAtChannel& channel) {
+    return hal::ModuleRegistry::Instance().DetectModule(channel);
+  });
 }
 
 Result<std::unique_ptr<CellularDevice>> CellularDevice::Create(
@@ -128,9 +118,50 @@ Result<std::unique_ptr<CellularDevice>> CellularDevice::Create(
   auto impl = std::make_unique<Impl>();
   impl->at_uart = std::move(channel);
 
-  auto hal_result = hal::ModuleRegistry::Instance().CreateModule(type);
+  return BringUp(std::move(impl), [type](at_channel::IAtChannel&) {
+    return hal::ModuleRegistry::Instance().CreateModule(type);
+  });
+}
+
+int CellularDevice::AlignBeforeIdentify(at_channel::IAtChannel& channel) {
+  // Read before the scan, which moves the channel: this is the rate the caller
+  // asked for, and it is what stage two restores the link to.
+  const int requested = channel.GetBaudRate();
+
+  // The scan's error is deliberately dropped. It means "no candidate answered",
+  // which is exactly the state a module with no AT+IPR? support is left in, and
+  // it has already put the channel back where the caller set it. What the
+  // identification does next is the real answer to whether this is a device.
+  if (requested > 0) {
+    (void)at_channel::FindModuleBaudRate(
+        channel, at_channel::BaudRateCandidates(requested));
+  }
+  return requested;
+}
+
+Result<> CellularDevice::AlignAfterIdentify(at_channel::IAtChannel& channel,
+                                            int requested) {
+  // A channel that does not name a rate cannot be moved to one and cannot be
+  // told apart from a stub, so it is left alone rather than written to.
+  if (requested <= 0) return {};
+
+  auto aligned = at_channel::SetModuleBaudRate(channel, requested);
+  if (!aligned) return std::unexpected(aligned.error().ToNetworkError());
+  return {};
+}
+
+Result<std::unique_ptr<CellularDevice>> CellularDevice::BringUp(
+    std::unique_ptr<Impl> impl,
+    const IdentifyFn& identify) {
+  const int requested = AlignBeforeIdentify(*impl->at_uart);
+
+  auto hal_result = identify(*impl->at_uart);
   if (!hal_result) {
     return std::unexpected(hal_result.error());
+  }
+
+  if (auto aligned = AlignAfterIdentify(*impl->at_uart, requested); !aligned) {
+    return std::unexpected(aligned.error());
   }
 
   return Assemble(std::move(impl), std::move(*hal_result));

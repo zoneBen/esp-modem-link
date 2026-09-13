@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -123,6 +124,107 @@ TEST_F(CellularDeviceTest, DetectRejectsNullChannel) {
       std::unique_ptr<at_channel::IAtChannel>());
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, NetworkErrc::kInvalidArgument);
+}
+
+// --- Rate alignment at the seam ---
+//
+// This is the ordering the library used to get wrong. The AT+IPR negotiation
+// ran inside Ml307Hal::Initialize, which Detect only reaches after
+// DetectModule has already tried to identify the module - and a module on
+// another rate answers nothing at all, so detection failed before the
+// negotiation could run. Every unit test of the negotiation passed regardless,
+// because they called Initialize directly and stepped over this seam. These
+// tests go through it.
+
+// Against the old ordering this fails with "no compatible module detected":
+// AT+CGMR is sent while the module is still listening at 115200.
+TEST_F(CellularDeviceTest, DetectSettlesTheRateBeforeIdentifyingTheModule) {
+  auto mock = std::make_unique<MockAtChannel>();
+  mock->SetModuleBaudRate(115200);
+  mock->SetBaudRate(921600);
+  mock->ExpectCommand("AT+IPR?")
+      .RespondInTurn({"+IPR: 115200\r\nOK\r\n",    // asked at 115200 and answered
+                      "+IPR: 921600\r\nOK\r\n"});  // and again once it has moved
+  mock->ExpectCommand("AT+IPR=?")
+      .Respond("+IPR: (1200,4800,115200),(0,300,115200,921600)\r\nOK\r\n");
+  mock->ExpectCommand("AT+IPR=921600").Respond("OK\r\n");
+  mock->ExpectCommand("AT+CGMR").Respond(kCgmrMl307);
+  mock->ExpectCommand("ATE0").Respond("OK\r\n");
+  mock->ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+  auto* channel = mock.get();
+
+  auto result = CellularDevice::Detect(std::move(mock));
+
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_EQ((*result)->GetModuleType(), ModuleType::kMl307);
+  EXPECT_TRUE(channel->WasCommandSent("AT+IPR=921600"));
+  EXPECT_EQ(channel->GetBaudRate(), 921600);
+}
+
+// The reverse direction, which the negotiation's own comment calls the normal
+// outcome of a previous run: the caller asks for the default and finds the
+// module an earlier session left at 921600.
+TEST_F(CellularDeviceTest, CreateBringsAModuleLeftAtARaisedRateBack) {
+  auto mock = std::make_unique<MockAtChannel>();
+  mock->SetModuleBaudRate(921600);
+  mock->ExpectCommand("AT+IPR?")
+      .RespondInTurn({"+IPR: 921600\r\nOK\r\n", "+IPR: 115200\r\nOK\r\n"});
+  mock->ExpectCommand("AT+IPR=?")
+      .Respond("+IPR: (1200,115200),(0,300,115200,921600)\r\nOK\r\n");
+  mock->ExpectCommand("AT+IPR=115200").Respond("OK\r\n");
+  mock->ExpectCommand("ATE0").Respond("OK\r\n");
+  mock->ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+  auto* channel = mock.get();
+
+  auto result = CellularDevice::Create(ModuleType::kMl307, std::move(mock));
+
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  EXPECT_TRUE(channel->WasCommandSent("AT+IPR=115200"));
+  EXPECT_EQ(channel->GetBaudRate(), 115200);
+}
+
+// A device that has not been proved to be one of ours is never written to.
+// AT+IPR=<rate> survives a power cycle, so writing it to an unidentified device
+// would leave a stranger reconfigured - which is why the scan that finds the
+// rate is read-only and the write waits for identification.
+//
+// Observed through a Detect that succeeds, because a Detect that fails destroys
+// the channel it was handed and takes the command log with it: what is asserted
+// is that the identification is on the wire before the write is.
+TEST_F(CellularDeviceTest, IdentifiesTheModuleBeforeWritingARate) {
+  auto mock = std::make_unique<MockAtChannel>();
+  mock->SetModuleBaudRate(115200);
+  mock->SetBaudRate(921600);
+  mock->ExpectCommand("AT+IPR?")
+      .RespondInTurn({"+IPR: 115200\r\nOK\r\n", "+IPR: 921600\r\nOK\r\n"});
+  mock->ExpectCommand("AT+IPR=?")
+      .Respond("+IPR: (1200,4800,115200),(0,300,115200,921600)\r\nOK\r\n");
+  mock->ExpectCommand("AT+IPR=921600").Respond("OK\r\n");
+  mock->ExpectCommand("AT+CGMR").Respond(kCgmrMl307);
+  mock->ExpectCommand("ATE0").Respond("OK\r\n");
+  mock->ExpectCommand("AT+CFUN=1").Respond("OK\r\n");
+  auto* channel = mock.get();
+
+  auto result = CellularDevice::Detect(std::move(mock));
+
+  ASSERT_TRUE(result.has_value()) << result.error().Message();
+  const auto& sent = channel->SentCommands();
+  auto at_cgmr = std::find(sent.begin(), sent.end(), "AT+CGMR");
+  auto write = std::find(sent.begin(), sent.end(), "AT+IPR=921600");
+  ASSERT_NE(at_cgmr, sent.end());
+  ASSERT_NE(write, sent.end());
+  EXPECT_LT(at_cgmr, write)
+      << "the rate was written before the module was identified as one of ours";
+}
+
+// The shared fixture's module answers with a bare OK and never reports a rate.
+// That is a module that has been found, not one that was missing, so the scan
+// stops on it and nothing is written. Reading it as "not found" would send the
+// host on to a rate nothing is listening at.
+TEST_F(CellularDeviceTest, LeavesTheRateAloneWhenTheModuleDoesNotReportOne) {
+  EXPECT_TRUE(channel_->WasCommandSent("AT+IPR?"));
+  EXPECT_FALSE(channel_->WasCommandSent("AT+IPR="));
+  EXPECT_EQ(channel_->GetBaudRate(), 115200);
 }
 
 // --- Network waiting ---

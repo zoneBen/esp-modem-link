@@ -115,22 +115,6 @@ class Ml307Hal : public hal::IModuleHal {
       std::string_view cmd,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
 
-  // Brings the module's UART rate into line with the rate the channel is
-  // already configured for, before any other command is sent.
-  //
-  // A rate mismatch is not an error the module reports - it is silence, on
-  // every command - so it has to be settled first or everything after it fails
-  // for the wrong reason. The rate is worth getting right: a 29 KB response
-  // occupies about twice its size on the wire because the payload crosses as
-  // hex, which takes ~5.8 s at 115200 and only ~1.3 s at 921600, and at the
-  // slow rate the socket ends early with the last few hundred bytes
-  // outstanding in roughly one run in four.
-  //
-  // Failure to realign is not a failure to initialise: the module is left at
-  // whatever rate it is answering on, which is by definition one that works.
-  // The exception is a channel that cannot follow a module that has already
-  // moved, which leaves nothing able to talk and is reported.
-  Result<> AlignBaudRate();
   Result<> ActivatePdp();
 
   // Socket setup steps shared by TCP and UDP. Ordered per the module's own
@@ -204,15 +188,11 @@ class Ml307Hal : public hal::IModuleHal {
   static_assert(kClosePollAttempts * kClosePollInterval >= kCidQuarantine,
                 "the close poll must outlast the quarantine it feeds");
 
-  // Confirming a new UART rate. The module does not answer the first command it
-  // receives at a rate it has just switched to - observed on ML307R-DL-MBRH0S01
-  // as a timeout on "AT", and then again on "AT+IPR?", at 921600 - so the check
-  // is retried rather than taken as a refusal. The timeout is short because each
-  // failed attempt costs it in full, and a module that will answer does so at
-  // once.
-  static constexpr int kBaudProbeAttempts = 4;
-  static constexpr auto kBaudProbeTimeout = std::chrono::milliseconds(500);
-
+  // Confirming a new UART rate, and the hardware reason it is retried rather
+  // than read as a refusal ("the module does not answer the first command at a
+  // rate it has just switched to", observed at 921600), live with the
+  // negotiation itself: at_channel::SetModuleBaudRate.
+  //
   // Rendezvous between the connect path and the +MIPOPEN URC handler. The id
   // field doubles as the "someone is waiting" flag so a URC for an unrelated
   // connection id is ignored rather than mistaken for ours.

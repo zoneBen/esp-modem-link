@@ -41,6 +41,7 @@ set(ESP_MODEM_LINK_PRIVATE_SOURCES
   src/at_channel/response_parser.cpp
   src/at_channel/urc_dispatcher.cpp
   src/at_channel/at_uart.cpp
+  src/at_channel/baud_alignment.cpp
   src/hal/module_registry.cpp
   src/hal/hal_tcp_client.cpp
   src/hal/hal_udp_client.cpp
@@ -65,6 +66,7 @@ set(ESP_MODEM_LINK_PRIVATE_HEADERS
   src/at_channel/response_parser.h
   src/at_channel/urc_dispatcher.h
   src/at_channel/at_uart.h
+  src/at_channel/baud_alignment.h
   src/platform/itask.h
   src/platform/iqueue.h
   src/platform/ievent_group.h

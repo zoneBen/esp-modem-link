@@ -12,6 +12,13 @@ std::vector<std::string_view> SplitCsv(std::string_view line);
 
 std::string_view StripQuotes(std::string_view s);
 
+// Strip the "+KEY:" prefix from a response line, returning just the value part.
+// AT responses look like "+CSQ: 23,99" and the key must not be fed to field
+// parsers, or every field shifts by one. A line with no colon is returned as it
+// is, so a caller that is not sure whether it holds a keyed line can strip
+// unconditionally.
+std::string_view StripKeyPrefix(std::string_view line);
+
 std::optional<int> ParseInt(std::string_view s);
 
 std::optional<double> ParseDouble(std::string_view s);

@@ -223,6 +223,42 @@ TEST_F(AtUartBasicTest, SetBaudRate) {
   EXPECT_EQ(mock_uart_->GetBaudRate(), 9600);
 }
 
+// A rate change drops whatever is half-assembled in the receiver. Those bytes
+// were clocked at the old rate, and left in place they are glued to the front of
+// the next real line - one line assembled from two rates, which parses as
+// neither. This runs on the critical path of every Detect and Create now, since
+// the rate negotiation sits there.
+//
+// A URC is the observable case, and the one that matters: it is the only thing
+// arriving here with nothing behind it to retry. A swallowed "+CSQ" never
+// arrives again, whereas a command's answer that is lost to a rate change costs
+// a retry that the alignment already performs.
+TEST_F(AtUartBasicTest, RateChangeDropsAHalfReceivedLine) {
+  int calls = 0;
+  std::string args;
+  at_uart_->SubscribeUrc("+CSQ", [&](std::string_view, std::string_view a) {
+    ++calls;
+    args = std::string(a);
+  });
+
+  // A line with no terminator behind it yet: the receiver is holding it.
+  mock_uart_->InjectRx("+CS");
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  at_uart_->SetBaudRate(9600);
+  // Long enough for the receive task to come out of its read and act on the
+  // change before the next line arrives.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  mock_uart_->InjectRx("+CSQ: 31,99\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Without the discard the line arrives as "+CS+CSQ: 31,99", matches no
+  // subscription, and is dropped as an unrecognised line.
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(args, "31,99");
+}
+
 TEST_F(AtUartBasicTest, SendRaw) {
   const char data[] = "hello";
   auto result = at_uart_->SendRaw(data, 5);

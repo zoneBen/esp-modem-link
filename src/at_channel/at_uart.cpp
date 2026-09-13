@@ -216,6 +216,12 @@ int AtUart::GetBaudRate() const {
 AtResult AtUart::SetBaudRate(int baud) {
   uart_.SetBaudRate(baud);
   config_.baud_rate = baud;
+
+  // Whatever is in the receive queue was clocked at the old rate and decodes as
+  // noise at the new one. Dropping it here is what keeps the next command from
+  // being answered with the previous rate's garbage.
+  uart_.Flush();
+  discard_partial_line_ = true;
   return {};
 }
 
@@ -238,8 +244,32 @@ void AtUart::ReceiveTask() {
         kEventStop, false, false, std::chrono::milliseconds(0));
     if (stop_bits & kEventStop) break;
 
+    // A rate change invalidates whatever is half-assembled here: those bytes
+    // were clocked at the old rate, and a line with no "\r\n" behind it yet
+    // would otherwise be glued to the front of the next real line and parsed as
+    // part of it.
+    if (discard_partial_line_.exchange(false)) {
+      line_buffer.clear();
+    }
+
     int bytes_read = uart_.Receive(
         buffer.data(), kBufferSize, std::chrono::milliseconds(100));
+
+    // The check above only covers a change that had already happened when this
+    // iteration started. A change that lands while the task is blocked in the
+    // read is caught here instead, and it has to be: Flush() cannot reach into
+    // an in-flight read, so these bytes may be the tail of the old rate and they
+    // would be appended to the very partial the flag exists to drop - one line
+    // assembled from two rates, which parses as neither.
+    //
+    // Dropping them costs at most the first answer after a change. Every caller
+    // that changes a rate already tolerates a lost answer: the confirmation
+    // probe retries, and the scan that finds the module tolerates one silence.
+    // Keeping them costs a URC, which nothing retries.
+    if (discard_partial_line_.exchange(false)) {
+      line_buffer.clear();
+      continue;
+    }
 
     if (bytes_read <= 0) continue;
 

@@ -89,6 +89,11 @@ class AtUart : public IAtChannel {
   std::atomic<bool> running_{false};
 
   std::atomic<int> data_mode_connect_id_{-1};
+
+  // Set by SetBaudRate and consumed by the receive task, which clears the
+  // partial line it is holding. The partial line lives on the task's stack, so
+  // this is the only way the caller that changed the rate can reach it.
+  std::atomic<bool> discard_partial_line_{false};
 };
 
 }  // namespace esp_modem_link::at_channel
