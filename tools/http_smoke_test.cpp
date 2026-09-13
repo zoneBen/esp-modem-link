@@ -347,31 +347,35 @@ int main(int argc, char** argv) {
         auto wrote = http.Write(piece.data(), piece.size());
         if (!wrote) {
           wrote_all = false;
-          // The server answering mid-body is not the framing's fault, and the
-          // client is expected to stop and say so rather than keep writing into
-          // a socket the server has let go of.
-          answered_early = wrote.error().code == NetworkErrc::kProtocolError;
+          // Two shapes of the same outcome are legitimate here. The client may
+          // have seen the answer arrive and stopped on its own (kProtocolError),
+          // or the module may have refused the send because the peer had already
+          // torn the connection down (kConnectionLost). Both mean the server
+          // answered mid-body; neither is the framing's fault.
+          answered_early = wrote.error().code == NetworkErrc::kProtocolError ||
+                           wrote.error().code == NetworkErrc::kConnectionLost;
           Check("every chunk is accepted", answered_early,
                 Describe(wrote.error()).c_str());
           if (!answered_early && !http.GetStatusCode().has_value()) {
-            // Measured against www.baidu.com, which answers a POST to / with a
-            // 302 and closes: that answer arrives while AT+MIPSEND is still in
-            // flight, and AtUart folds a line arriving mid-command into that
-            // command's response instead of handing it to the URC handlers. The
-            // 302 is swallowed there, so the module's CME 550 on the next send
-            // is all that is left to report. The framing is not what failed -
-            // the chunk sends either side of the bad one were accepted - but
-            // the upload cannot be finished until a response that arrives in
-            // that window survives it.
+            // A refusal that is neither of those two shapes, with no answer in
+            // hand either: the write failed for a reason that is not the peer
+            // having answered. Measured against www.baidu.com, which answers a
+            // POST to / with a 302 and hangs up immediately - the module tears the
+            // socket down when the peer closes and discards whatever it still had
+            // buffered, so the send that follows is refused with "+CME ERROR: 3"
+            // and the 302 that preceded it can be thrown away with the rest. The
+            // framing is not what failed - the chunks either side of the refused
+            // one were accepted - but the upload cannot be finished once the peer
+            // has gone. Running this against a host that reads the whole body
+            // first - httpbin.org, which answers 405 only after the terminator -
+            // passes.
             std::printf(
-                "      note: the host answered before the body was finished and "
-                "the answer never reached the client. A line that arrives while "
-                "an AT command is in flight is absorbed into that command's "
-                "response rather than dispatched as a URC, so the early answer "
-                "is lost and the next send fails on a socket the host has "
-                "already closed. Running this against a host that reads the "
-                "whole body first - httpbin.org, which answers 405 only after "
-                "the terminator - passes.\n");
+                "      note: the host hung up before the body was finished. This "
+                "host answers 302 to a POST to / and closes immediately, and this "
+                "firmware drops a closed socket's buffered bytes, so an answer "
+                "that arrives in that window can be lost with them. Running this "
+                "against a host that reads the whole body first - httpbin.org, "
+                "which answers 405 only after the terminator - passes.\n");
           }
           break;
         }
@@ -436,8 +440,28 @@ int main(int argc, char** argv) {
   {
     auto response = http.Execute("GET", secure);
     if (!response) {
+      // A failure here is the firmware, not the software engine. Measured on the
+      // Air780E: the module discards a TLS socket's unread bytes the moment it
+      // processes the peer's close, so a body is delivered only as far as it was
+      // read before that moment. Read back-to-back, 2099 bytes were still queued
+      // when the close arrived and not one read after it succeeded; read not at
+      // all - a request for /robots.txt with the shell idle - two arrivals were
+      // announced and the unread count was 0 by the time the first read was
+      // issued, so the whole response went with them.
+      //
+      // Nothing above can recover those bytes, and the shortfall is reported
+      // rather than passed off as a whole response, which is the correct thing to
+      // do with a body that really is short.
       Check("HTTPS through the software engine", false,
             Describe(response.error()).c_str());
+      if (response.error().code == NetworkErrc::kConnectionLost) {
+        std::printf(
+            "      note: this firmware discards a TLS socket's unread bytes when "
+            "the peer closes it, so only what was read before the close arrives. "
+            "A page this size cannot be read fast enough to be whole; the "
+            "connection is reported lost rather than the body being passed off "
+            "as complete.\n");
+      }
     } else {
       Check("HTTPS returns 200", response->status_code == 200,
             "status " + std::to_string(response->status_code));
@@ -450,6 +474,13 @@ int main(int argc, char** argv) {
   // authority refusing to verify is the module behaving correctly, and the run
   // above already proved the transport works. Anything that is not that refusal
   // is a real failure, so those are still counted.
+  //
+  // Which code the refusal arrives as depends on how much the HAL knows. ML307
+  // cannot tell that its context holds no authority until it tries, so it reports
+  // the handshake failure with the module's own code in `native`. AIR780E refuses
+  // before sending anything, because no command it accepts installs an authority
+  // at all - so its refusal is kNotSupported and names the field. Both are the
+  // same answer to the caller, and the second is the more useful one.
   {
     TlsConfig config;
     config.verify_certificate = true;
@@ -460,14 +491,14 @@ int main(int argc, char** argv) {
     if (response) {
       Check("HTTPS with verification returns 200", response->status_code == 200,
             "status " + std::to_string(response->status_code));
-    } else if (response.error().code == NetworkErrc::kTlsHandshakeFailed) {
+    } else if (response.error().code == NetworkErrc::kTlsHandshakeFailed ||
+               response.error().code == NetworkErrc::kNotSupported) {
       std::printf(
           "  note: the module will not perform a verified handshake: %s\n"
-          "      AT+MSSLCFG=\"cert\" reads back \"NULL\",\"NULL\",\"NULL\" on "
-          "this firmware, so its SSL context holds no certificate authority to "
-          "check a server against. A TlsConfig that asks for verification "
-          "therefore cannot be honoured here; the connection above succeeded "
-          "because the default asks for none.\n",
+          "      this firmware offers no way to install a certificate authority, "
+          "so there is nothing to check a server against. A TlsConfig that asks "
+          "for verification therefore cannot be honoured here; the connection "
+          "above succeeded because the default asks for none.\n",
           Describe(response.error()).c_str());
     } else {
       Check("HTTPS with verification", false, Describe(response.error()).c_str());

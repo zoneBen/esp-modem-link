@@ -15,7 +15,18 @@ target_include_directories(esp_modem_link_smoke_test
 
 add_test(NAME smoke_test COMMAND esp_modem_link_smoke_test)
 
-# GoogleTest-based unit tests (optional - skipped if download fails)
+# GoogleTest-based unit tests.
+#
+# The download below needs GitHub. When it is unreachable, FetchContent_Populate
+# does not return a failure - it raises a fatal configure error - so the warning
+# at the bottom of this file is NOT a fallback for a failed download. Point
+# FetchContent at a tree that is already on disk instead, which skips the
+# download and update steps entirely:
+#
+#   cmake -S . -B build/tests -DESP_MODEM_LINK_BUILD_TESTS=ON \
+#     -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<path-to-googletest-1.15.2>
+#
+# The version must be v1.15.2 to match what the URL would have fetched.
 include(FetchContent)
 FetchContent_Declare(
   googletest
@@ -52,6 +63,7 @@ if(NOT googletest_POPULATED)
       test_software_ws_client.cpp
       test_software_http_client.cpp
       test_ml307_hal.cpp
+      test_air780e_hal.cpp
     )
 
     target_link_libraries(esp_modem_link_tests

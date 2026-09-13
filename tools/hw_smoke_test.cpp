@@ -81,6 +81,7 @@ const char* ModuleName(ModuleType type) {
   switch (type) {
     case ModuleType::kMl307: return "ML307";
     case ModuleType::kEc801E: return "EC801E";
+    case ModuleType::kAir780E: return "AIR780E";
     default: return "unknown";
   }
 }

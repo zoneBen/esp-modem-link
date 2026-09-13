@@ -52,6 +52,7 @@ Platform Abstraction (平台抽象：支持 ESP-IDF / POSIX / Mock)
 | 厂商 | 型号 | 类型 |
 |---|---|---|
 | 中移物联 | ML307R/A | Cat.1 |
+| 合宙 | Air780E / Air780EPV | Cat.1 |
 | 移远 | EC801E / EC600N | Cat.1 |
 | 移远 | BG95/BG96 | Cat.M1/NB-IoT |
 | 广和通 | L610 | Cat.1 |
@@ -60,9 +61,15 @@ Platform Abstraction (平台抽象：支持 ESP-IDF / POSIX / Mock)
 
 ## 下一步
 
-1. 搭建项目骨架（Platform 抽象层 + AtUart）
-2. 实现 Module HAL 基类和第一个模组（ML307）
-3. 实现传输层协议（TCP/UDP）
-4. 实现应用层协议（HTTP/MQTT/WebSocket）
-5. 移植第二个模组（EC801E）验证 HAL 模式的扩展性
+1. ~~搭建项目骨架（Platform 抽象层 + AtUart）~~
+2. ~~实现 Module HAL 基类和第一个模组（ML307）~~
+3. ~~实现传输层协议（TCP/UDP）~~
+4. ~~实现应用层协议（HTTP/MQTT/WebSocket）~~
+5. ~~移植第二个模组验证 HAL 模式的扩展性~~ — 2026-09 以 AIR780E 落地
+   （`src/modules/air780e/`），实测固件 `AirM2M_780EPV_V1004_LTE_AT`。
+   抽象成立，但暴露了共享 AT 层的两个洞（命令进行中的 URC 被吞、
+   模组自己读命令的回显会被误当作 URC），已一并修在 `AtUart`。
+   该固件的两处硬限制记录在 `air780e_hal.h`：`AT+CIPSSL` 是全模组
+   单开关，SSL 与非 SSL socket 不能并存；没有写证书的命令，
+   `TlsConfig` 的校验字段无法兑现。
 6. 完善测试和文档

@@ -48,6 +48,7 @@ set(ESP_MODEM_LINK_PRIVATE_SOURCES
   src/network/cellular_network.cpp
   src/modules/module_registrations.cpp
   src/modules/ml307/ml307_hal.cpp
+  src/modules/air780e/air780e_hal.cpp
   src/protocol/mqtt/mqtt_packet.cpp
   src/protocol/mqtt/software_mqtt_client.cpp
   src/protocol/http/http_parser.cpp
@@ -83,6 +84,7 @@ set(ESP_MODEM_LINK_PRIVATE_HEADERS
   src/network/cellular_network.h
   src/modules/module_registrations.h
   src/modules/ml307/ml307_hal.h
+  src/modules/air780e/air780e_hal.h
   src/protocol/mqtt/mqtt_packet.h
   src/protocol/mqtt/software_mqtt_client.h
   src/protocol/http/http_parser.h
@@ -174,6 +176,10 @@ if(ESP_MODEM_LINK_PLATFORM STREQUAL "POSIX" AND NOT DEFINED IDF_TARGET)
   add_executable(tcp_trace tools/tcp_trace.cpp)
   target_link_libraries(tcp_trace PRIVATE esp_modem_link)
   target_include_directories(tcp_trace PRIVATE src)
+
+  add_executable(air780e_probe tools/air780e_probe.cpp)
+  target_link_libraries(air780e_probe PRIVATE esp_modem_link)
+  target_include_directories(air780e_probe PRIVATE src)
 endif()
 
 if(ESP_MODEM_LINK_BUILD_EXAMPLES)

@@ -52,7 +52,14 @@ std::string ToVisible(std::string_view raw, size_t limit = 200) {
 int main(int argc, char** argv) {
   const std::string port = argc > 1 ? argv[1] : "COM8";
   const std::string apn = argc > 2 ? argv[2] : "cmnet";
-  const std::string host = argc > 3 ? argv[3] : "pool.ntp.org";
+  // An address, not a name, and this one in particular because the name is not
+  // enough: "pool.ntp.org" resolves and the socket opens, but no member of the
+  // pool ever answers it from this carrier, so the test waits out its full 20 s
+  // on a datagram that was never sent. Measured - pool.ntp.org: no reply, twice;
+  // 203.107.6.88 and 120.25.115.20: 48 bytes each, first try. A name that does
+  // not answer is indistinguishable here from a receive path that does not work,
+  // so the default is the address that settles the question the test is asking.
+  const std::string host = argc > 3 ? argv[3] : "203.107.6.88";
   const uint16_t udp_port =
       static_cast<uint16_t>(argc > 4 ? std::atoi(argv[4]) : 123);
 

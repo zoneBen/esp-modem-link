@@ -13,6 +13,10 @@ enum class ModuleType {
   kN58,
   kA7670C,
   kEspAt,
+  // Appended rather than placed beside the other 合宙 entries: inserting in the
+  // middle would renumber every enumerator after it, and these values are
+  // crossed by the module registry and a caller's persisted config.
+  kAir780E,
 };
 
 enum class NetworkProtocol {
