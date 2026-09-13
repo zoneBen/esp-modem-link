@@ -13,7 +13,7 @@
 | 类名 | PascalCase | `TcpClient`, `MqttClient` |
 | 接口名 | I 前缀 + PascalCase | `IModuleHal`, `IAtChannel` |
 | 枚举类 | PascalCase | `NetworkErrc`, `MqttQoS` |
-| 枚举值 | PascalCase | `Timeout`, `QoS0` |
+| 枚举值 | k 前缀 + PascalCase | `kTimeout`, `kQoS0` |
 | 方法名 | PascalCase | `Connect()`, `SendData()` |
 | 成员变量 | 后缀下划线 | `connected_`, `on_data_` |
 | 常量 | k 前缀 + PascalCase | `kMaxConnections`, `kDefaultTimeout` |
@@ -64,13 +64,19 @@
 
 3. **回调参数按"主题 + 详情"顺序排列**
    ```cpp
-   // MQTT 消息：topic 是主题，payload 是详情
-   using MessageCallback = std::function<void(std::string_view topic,
-                                              std::string_view payload)>;
+   // UDP 数据报：来源地址是主题，载荷是详情
+   using UdpMessageCallback = std::function<void(std::string_view host,
+                                                  uint16_t port,
+                                                  std::string_view data)>;
 
    // TCP 数据：数据是主题，长度是详情（通过 string_view 一体表达）
    using DataCallback = std::function<void(std::string_view data)>;
    ```
+   这条准则的例外是 MQTT：它的"详情"不止 payload 一样——qos、retain、
+   message_id 都是随消息一起到达的投递属性，平铺成参数会让签名随协议长出
+   新字段而改动，也会让调用方无法把"这条消息"当作一个东西传给别处。所以
+   那里传的是按值的 `MqttMessage`（见 3.6），主题 + 详情的顺序仍然成立，
+   只是都装在同一个结构体里。
 
 4. **错误回调统一使用 `const NetworkError&`**
    ```cpp
@@ -120,15 +126,20 @@ template <typename T = void>
 using Result = std::expected<T, NetworkError>;
 
 // AT 层错误
-enum class AtErrc { Timeout, CommandError, CmeError, CmsError,
-                    TransmitFailed, NotInitialized };
+enum class AtErrc { kTimeout, kCommandError, kCmeError, kCmsError,
+                    kTransmitFailed, kNotInitialized, kNotSupported };
 
+// cme 和 cms 只有一个有效，由 code 决定是哪个：构造时按 code 归位，所以
+// 调用方不必自己判断该填哪个字段，也不会出现两个都填了而其中一个没意义
+// 的情况。这里没有 esp_err_t 成员——AT 层不该依赖 ESP-IDF 的平台类型。
 struct AtError {
     AtErrc code;
     int cme = 0;
     int cms = 0;
-    esp_err_t esp = ESP_OK;
     std::string context;
+
+    AtError(AtErrc code, std::string ctx = "");
+    AtError(AtErrc code, int cme_or_cms, std::string ctx = "");
 
     NetworkError ToNetworkError() const;
     std::string ToString() const;
@@ -146,8 +157,12 @@ using AtValue = std::expected<T, AtError>;
 using DataCallback = std::function<void(std::string_view data)>;
 using ErrorCallback = std::function<void(const NetworkError& error)>;
 using EventCallback = std::function<void()>;
-using CloseCallback = std::function<void(int code, std::string_view reason)>;
 ```
+
+这里没有 WebSocket 的关闭回调：它要 `WebSocketCloseCode`，而那个类型属于
+WebSocket 而不是这个头文件，所以别名定义在 `websocket_client.h` 里
+（`WebSocketCloseCallback`）。同理 MQTT 的 `MqttMessageCallback` 定义在
+`mqtt_client.h`——本头文件是一份"别人类型的别名清单"，不该反过来依赖它们。
 
 ### 2.3 配置结构体
 
@@ -173,7 +188,9 @@ struct TlsConfig {
 struct MqttWill {
     std::string topic;
     std::string payload;
-    MqttQoS qos = MqttQoS::QoS0;
+    // int 而不是 MqttQoS：MqttQoS 定义在 mqtt_client.h，而这个头文件被它
+    // include，反向依赖会成环。
+    int qos = 0;
     bool retain = false;
 };
 ```
@@ -300,6 +317,11 @@ protected:
 
 ### 3.4 UdpClient
 
+**接收回调**：源地址是回调的参数而不是一个 `ReceivedPacket` 结构体。一个
+数据结构意味着一次分配或一次引用，而这里要传的三样东西——地址、端口、载荷
+——都是调用方在这一个瞬间才需要的东西，且载荷是 `string_view`，指向的缓冲
+在回调返回后就不再有效。收进结构体只会让它看起来像能留存。
+
 ```cpp
 class UdpClient {
 public:
@@ -307,24 +329,19 @@ public:
 
     // 连接模式（固定远端地址）
     virtual Result<> Connect(std::string_view host, uint16_t port) = 0;
+    // 无连接模式：本地绑定
+    virtual Result<> Bind(uint16_t port) = 0;
     virtual void Disconnect() = 0;
 
-    // 发送（连接模式）
+    // 发送
     virtual Result<int> Send(const void* data, size_t len) = 0;
-    Result<int> Send(std::string_view data) { return Send(data.data(), data.size()); }
-
-    // 无连接模式：向指定地址发送
     virtual Result<int> SendTo(const void* data, size_t len,
                                std::string_view host, uint16_t port) = 0;
 
     // 接收回调（携带源地址）
-    struct ReceivedPacket {
-        std::string_view data;
-        std::string remote_host;
-        uint16_t remote_port;
-    };
-    using PacketCallback = std::function<void(const ReceivedPacket& pkt)>;
-    void OnPacket(PacketCallback callback) { on_packet_ = std::move(callback); }
+    void OnMessage(UdpMessageCallback callback) {
+        on_message_ = std::move(callback);
+    }
 
     // 错误
     void OnError(ErrorCallback callback) { on_error_ = std::move(callback); }
@@ -332,16 +349,25 @@ public:
     bool IsConnected() const { return connected_; }
 
 protected:
-    PacketCallback on_packet_;
+    UdpMessageCallback on_message_;
     ErrorCallback on_error_;
     bool connected_ = false;
 };
 ```
 
+`UdpMessageCallback` 的形状就是"主题 + 详情"：地址和端口是主题（这条数据是
+谁发来的），载荷是详情。
+
+```cpp
+using UdpMessageCallback = std::function<void(std::string_view host,
+                                               uint16_t port,
+                                               std::string_view data)>;
+```
+
 **设计说明**：
 - 区分"连接模式"和"无连接模式"，两者可共存
 - 接收回调携带源地址信息（原库缺失）
-- `ReceivedPacket` 结构体组织相关数据
+- 源地址是回调参数，不是一个 `ReceivedPacket` 结构体（见上）
 
 ### 3.5 HttpClient
 
@@ -360,13 +386,8 @@ public:
     virtual void SetMaxRedirects(int max) = 0;
 
     // 简单请求（一步完成，适合小响应）
-    struct SimpleResponse {
-        int status_code;
-        std::map<std::string, std::string> headers;
-        std::string body;
-    };
-    virtual Result<SimpleResponse> Execute(std::string_view method,
-                                            std::string_view url) = 0;
+    virtual Result<HttpResponse> Execute(std::string_view method,
+                                         std::string_view url) = 0;
 
     // 流式请求（适合大文件/OTA）
     virtual Result<> Open(std::string_view method, std::string_view url) = 0;
@@ -380,26 +401,52 @@ public:
     virtual size_t GetContentLength() const = 0;
     virtual bool IsChunked() const = 0;
 };
+
+// 顶层类型，不是 HttpClient 的嵌套类型：Execute() 的返回值要被调用方存
+// 起来、被传出去，嵌套会把这个名字绑在客户端上。
+struct HttpResponse {
+    int status_code = 0;
+    std::map<std::string, std::string> headers;
+    std::string body;
+};
 ```
 
 **设计说明**：
 - 提供两种使用模式：`Execute()` 简单请求 + `Open/Read/Write` 流式请求
-- `SimpleResponse` 结构体封装完整响应
+- `HttpResponse` 结构体封装完整响应（顶层 `HttpResponse`，不是嵌套的
+  `SimpleResponse`）
+- `IsChunked()` 回答的是响应体的**框架**问题：分块响应不带 Content-Length，
+  所以 `GetContentLength()` 返回 0 而后面仍有响应体。`Read()` 两种框架都
+  会解码——这个方法只是给想知道"响应是怎么装的"的调用方看的
 - 支持重定向跟随（原库缺失）
 - 响应头查询不返回错误（没找到就是空字符串）
 
 ### 3.6 MqttClient
 
 ```cpp
-enum class MqttQoS { QoS0 = 0, QoS1 = 1, QoS2 = 2 };
+enum class MqttQoS { kQoS0 = 0, kQoS1 = 1, kQoS2 = 2 };
 
+// 一条消息连同代理给它的投递属性。属性属于消息而不是属于通知：调用方按
+// 一个 QoS 订阅、却收到另一个 QoS 的消息时，没有别的地方能看出这条消息
+// 是在哪个保证下到达的；而置了 retain 的发布和只是匹配了过滤器的发布也
+// 不是一回事。
 struct MqttMessage {
     std::string topic;
     std::string payload;
-    MqttQoS qos = MqttQoS::QoS0;
+    MqttQoS qos = MqttQoS::kQoS0;
+    // 只在订阅刚刚建立、代理因此送来这条消息时为 true。协议要求从既有订阅
+    // 转发的消息上它必须是 clear，所以一般是 false——但不是一定。
     bool retain = false;
+    // 它到达时那条 PUBLISH 的报文标识；QoS 0 时为 0，因为线上没有标识。
+    // 回调运行时它已经不能当句柄用：相关的确认早就发出去了。
     int message_id = 0;
 };
+
+// 按值传递而不是按引用，两个理由指向同一个方向：消息自己持有那些字符串，
+// 想留存的回调应该能直接拿走而不必再拷一次——而指向引擎局部变量的
+// `const MqttMessage&` 在一个把它存下来的调用方眼里同样安全。引擎反正都要
+// 构造这个对象，move 不花代价。
+using MqttMessageCallback = std::function<void(MqttMessage message)>;
 
 class MqttClient {
 public:
@@ -410,33 +457,39 @@ public:
     virtual void SetCredentials(std::string_view user,
                                 std::string_view pass) = 0;
     virtual void SetKeepAlive(int seconds) = 0;
-    virtual void SetCleanSession(bool clean) = 0;
     virtual void SetWill(const MqttWill& will) = 0;
     virtual void SetTlsConfig(const TlsConfig& config) = 0;
 
-    // 连接
-    virtual Result<> Connect(std::string_view host, uint16_t port) = 0;
+    // 连接。clean_session 是参数而不是 setter：它是 CONNECT 报文的一个字段，
+    // 而 CONNECT 只发一次——setter 唯一能做的事就是改变下一次 Connect() 的
+    // 含义，而这里已经在做出调用的同一句话里说清了。
+    virtual Result<> Connect(std::string_view host,
+                             uint16_t port,
+                             bool clean_session = true) = 0;
     virtual void Disconnect() = 0;
 
     // 发布
     virtual Result<int> Publish(std::string_view topic,
                                 std::string_view payload,
-                                MqttQoS qos = MqttQoS::QoS0,
+                                MqttQoS qos = MqttQoS::kQoS0,
                                 bool retain = false) = 0;
 
     // 订阅
-    virtual Result<> Subscribe(std::string_view topic,
-                               MqttQoS qos = MqttQoS::QoS0) = 0;
+    virtual Result<int> Subscribe(std::string_view topic,
+                                  MqttQoS qos = MqttQoS::kQoS0) = 0;
     virtual Result<> Unsubscribe(std::string_view topic) = 0;
 
     // 回调
     void OnConnected(EventCallback callback) { on_connected_ = std::move(callback); }
     void OnDisconnected(EventCallback callback) { on_disconnected_ = std::move(callback); }
-    void OnMessage(std::function<void(const MqttMessage& msg)> callback) {
+    void OnMessage(MqttMessageCallback callback) {
         on_message_ = std::move(callback);
     }
     void OnError(ErrorCallback callback) { on_error_ = std::move(callback); }
-    void OnPublishAck(std::function<void(int message_id)> callback) {
+    // 代理收下一条消息时触发：QoS 1 发布的 PUBACK，或 QoS 2 的 PUBCOMP。
+    // 命名指向握手的结束而不是其中任何一半，且 QoS 0 永不触发——它没有
+    // 任何东西回过来。
+    void OnPublishComplete(PublishAckCallback callback) {
         on_publish_ack_ = std::move(callback);
     }
 
@@ -445,34 +498,53 @@ public:
 protected:
     EventCallback on_connected_;
     EventCallback on_disconnected_;
-    std::function<void(const MqttMessage&)> on_message_;
+    MqttMessageCallback on_message_;
     ErrorCallback on_error_;
-    std::function<void(int)> on_publish_ack_;
+    PublishAckCallback on_publish_ack_;
     bool connected_ = false;
 };
 ```
 
 **设计说明**：
 - `Publish()` 返回消息 ID（QoS 1/2 时用于确认追踪）
-- `OnMessage` 传递 `MqttMessage` 结构体，包含 topic/payload/qos/retain/msg_id
-- 新增 `OnPublishAck` 回调（QoS 1/2 发布确认）
+- `OnMessage` 传递 `MqttMessage` 结构体（按值），包含
+  topic/payload/qos/retain/message_id
+- `OnPublishComplete` 回调（QoS 1/2 发布确认；原名 `OnPublishAck`，因为它
+  覆盖 QoS 1 的 PUBACK 和 QoS 2 的 PUBCOMP 两半）
+- `clean_session` 是 `Connect()` 的参数，不是 `SetCleanSession()` setter
 - 配置方法在 Connect 前调用，不返回错误（参数错误在 Connect 时报）
 
 ### 3.7 WebSocketClient
 
 ```cpp
-enum class WsCloseCode {
-    Normal = 1000,
-    GoingAway = 1001,
-    ProtocolError = 1002,
-    UnsupportedData = 1003,
-    NoStatus = 1005,
-    Abnormal = 1006,
-    InvalidPayload = 1007,
-    PolicyViolation = 1008,
-    MessageTooBig = 1009,
-    InternalError = 1011,
+// 本库点得出名字的关闭码。这不是一个封闭集合：对端可以发协议允许范围内
+// 的任意码——留给应用的那一段，以及本文件写成之后才注册的——所以没有名字
+// 的码按它本来的数字上报，而不会被就近归类或丢掉。
+enum class WebSocketCloseCode : uint16_t {
+    kNormal = 1000,
+    kGoingAway = 1001,
+    kProtocolError = 1002,
+    kUnsupportedData = 1003,
+    kNoStatus = 1005,
+    kAbnormalClosure = 1006,
+    kInvalidPayloadData = 1007,
+    kPolicyViolation = 1008,
+    kMessageTooBig = 1009,
+    kMandatoryExtension = 1010,
+    kInternalError = 1011,
 };
+
+// 连接是怎么结束的：对端发了码就是它那个，没发就是本端选的那个。1005 和
+// 1006 在这里上报，且从不上线——那就是它们的含义。
+using WebSocketCloseCallback =
+    std::function<void(WebSocketCloseCode code, std::string_view reason)>;
+
+// 一条消息，连同发送方给它的类型。这个标志是文本帧和二进制帧离开它就无法
+// 区分的唯一依据，而 Send()/SendFragment() 都让发送方说明自己在发哪种，
+// 所以收不到它的接收方就成了这一对里不对称的那一半。分片到达的消息带的是
+// 开启它的那一帧的类型——后面的续帧不携带。
+using WebSocketMessageCallback =
+    std::function<void(std::string_view data, bool binary)>;
 
 class WebSocketClient {
 public:
@@ -480,9 +552,23 @@ public:
 
     // 配置
     virtual void SetHeader(std::string_view key, std::string_view value) = 0;
+    // wss:// 握手的设置。与 MQTT 不同，本客户端从 URL（ws:// 与 wss://）
+    // 读调用方的意图，所以这里是配置一条 scheme 已经要求了的 TLS 连接，
+    // 而不是打开它。也与 HTTP 不同——HTTP 可以跟随重定向跨过这条边界，
+    // 因此每个请求都重读配置：WebSocket 连接由一次 upgrade 打开，URL 是
+    // 事先知道的。连接建立时读取，所以改动从下一次 Connect() 生效，对一条
+    // 已经打开的 socket 无效——它早就过了握手。ws:// 连接完全忽略它。
     virtual void SetTlsConfig(const TlsConfig& config) = 0;
 
-    // 心跳
+    // 心跳。不置 enabled 就是关的，间隔为 0 时也是关的——每零秒一次 ping
+    // 是循环而不是心跳。timeout 是对端回答一个 ping 的期限，超时即认为连接
+    // 已死；timeout 为 0 表示改用 interval，所以只给了间隔的调用方仍然有
+    // 一个截止时间。
+    //
+    // 每次调用替换整个配置：没写到的字段回到下面的默认值，enabled 也是。
+    // 用指定初始化器点名字段是"只改一样、其余不动"的写法——
+    // SetHeartbeat({.interval = 5s, .enabled = true})——而只点要改的那个会
+    // 把心跳关掉，而不是调节它。
     struct HeartbeatConfig {
         std::chrono::seconds interval{30};
         std::chrono::seconds timeout{10};
@@ -490,7 +576,12 @@ public:
     };
     virtual void SetHeartbeat(const HeartbeatConfig& config) = 0;
 
-    // 自动重连
+    // 自动重连。不置 enabled 就是关的。连接掉线或心跳失败的连接随后按这个
+    // 计划重建：等待从 initial_delay 开始，每次失败后乘以 backoff_factor，
+    // 直到 max_delay。系数小于等于 1 时等待保持不变而不是缩短，起始为 0
+    // 表示立刻重试。max_retries 限制连续尝试次数，-1 表示不限。
+    //
+    // 与 SetHeartbeat 一样，每次调用替换整个配置。
     struct ReconnectConfig {
         bool enabled = false;
         int max_retries = -1;  // -1 = 无限
@@ -502,42 +593,54 @@ public:
 
     // 连接
     virtual Result<> Connect(std::string_view url) = 0;
-    virtual void Close(WsCloseCode code = WsCloseCode::Normal,
+    // 发一个关闭帧并短暂等待对端的，然后通过 OnDisconnected 上报连接是怎么
+    // 结束的：对端回答了就是它给的码，没回答就是这里要的那个。
+    virtual void Close(WebSocketCloseCode code = WebSocketCloseCode::kNormal,
                        std::string_view reason = "") = 0;
 
     // 发送
     virtual Result<> Send(std::string_view data, bool binary = false) = 0;
+    // 发送调用方自己在切分的一条消息中的一帧。一条消息的第一帧带文本或
+    // 二进制类型且 fin 为 false，其余是续帧——这就是消息开始之后不再看
+    // `binary` 的原因。一串分片是一次成序的调用：两个线程同时分片会把各自
+    // 的消息交错在一起。
+    virtual Result<> SendFragment(const void* data, size_t len,
+                                  bool binary, bool fin) = 0;
+    // 发一个 ping 并为它的 pong 开始计时。每个 pong 都会触发 OnPong，
+    // 包括心跳的那个。
     virtual void Ping(std::string_view payload = "") = 0;
 
     // 回调
     void OnConnected(EventCallback callback) { on_connected_ = std::move(callback); }
-    void OnDisconnected(std::function<void(WsCloseCode code,
-                                           std::string_view reason)> callback) {
+    void OnDisconnected(WebSocketCloseCallback callback) {
         on_disconnected_ = std::move(callback);
     }
-    void OnMessage(std::function<void(std::string_view data,
-                                      bool binary)> callback) {
+    void OnMessage(WebSocketMessageCallback callback) {
         on_message_ = std::move(callback);
     }
     void OnError(ErrorCallback callback) { on_error_ = std::move(callback); }
     void OnPong(DataCallback callback) { on_pong_ = std::move(callback); }
 
-    bool IsConnected() const { return connected_; }
+    bool IsConnected() const { return connected_.load(); }
 
 protected:
     EventCallback on_connected_;
-    std::function<void(WsCloseCode, std::string_view)> on_disconnected_;
-    std::function<void(std::string_view, bool)> on_message_;
+    WebSocketCloseCallback on_disconnected_;
+    WebSocketMessageCallback on_message_;
     ErrorCallback on_error_;
     DataCallback on_pong_;
-    bool connected_ = false;
+    // atomic：引擎在传输层的接收线程上写它，应用在自己的线程上读。
+    std::atomic<bool> connected_{false};
 };
 ```
 
 **设计说明**：
 - 内置心跳和自动重连（原库缺失，用户需自己实现）
-- 关闭码使用枚举类（`WsCloseCode`），提高可读性
+- 关闭码使用枚举类（`WebSocketCloseCode`），提高可读性
 - `OnDisconnected` 携带关闭码和原因
+- `SendFragment()` 由调用方自己分片，与服务端分片到达时的重组相对应；
+  两条路都保留，因为分片对发送方是"我不想一次拿出一整条消息"，对接收方
+  是"对端没有那么做"
 
 ## 四、AT 通道接口
 
@@ -777,11 +880,11 @@ void mqtt_example(NetworkInterface& net) {
 
     mqtt->SetClientId("esp32-test");
     mqtt->SetKeepAlive(60);
-    mqtt->SetWill({"status/offline", "device-offline", MqttQoS::QoS1, false});
+    mqtt->SetWill({"status/offline", "device-offline", 1, false});
 
     mqtt->OnConnected([]() { ESP_LOGI(TAG, "MQTT connected"); });
     mqtt->OnDisconnected([]() { ESP_LOGI(TAG, "MQTT disconnected"); });
-    mqtt->OnMessage([](const MqttMessage& msg) {
+    mqtt->OnMessage([](MqttMessage msg) {
         ESP_LOGI(TAG, "MQTT [%s] qos=%d: %.*s",
                  msg.topic.c_str(),
                  static_cast<int>(msg.qos),
@@ -797,8 +900,8 @@ void mqtt_example(NetworkInterface& net) {
         return;
     }
 
-    mqtt->Subscribe("test/esp32/in", MqttQoS::QoS1);
-    mqtt->Publish("test/esp32/out", "hello", MqttQoS::QoS0);
+    mqtt->Subscribe("test/esp32/in", MqttQoS::kQoS1);
+    mqtt->Publish("test/esp32/out", "hello", MqttQoS::kQoS0);
 }
 ```
 
@@ -818,7 +921,7 @@ void ws_example(NetworkInterface& net) {
     ws->OnMessage([](std::string_view data, bool binary) {
         ESP_LOGI(TAG, "WS recv: %.*s", (int)data.size(), data.data());
     });
-    ws->OnDisconnected([](WsCloseCode code, std::string_view reason) {
+    ws->OnDisconnected([](WebSocketCloseCode code, std::string_view reason) {
         ESP_LOGI(TAG, "WS closed: %d, %.*s",
                  static_cast<int>(code),
                  (int)reason.size(), reason.data());
@@ -841,11 +944,11 @@ void ws_example(NetworkInterface& net) {
 | TCP 创建 | `CreateTcp(0) -> unique_ptr<Tcp>` | `CreateTcp() -> Result<unique_ptr<TcpClient>>` | 返回值带错误，移除 connect_id 参数 |
 | TCP 发送 | `Send(data) -> int` | `Send(data) -> Result<int>` | 失败时返回错误而非 -1 |
 | TCP 错误回调 | 无（只有 OnDisconnected） | `OnError(callback)` | 新增 |
-| HTTP 简单请求 | 无 | `Execute(method, url) -> Result<SimpleResponse>` | 新增便捷方法 |
+| HTTP 简单请求 | 无 | `Execute(method, url) -> Result<HttpResponse>` | 新增便捷方法 |
 | HTTP 重定向 | 不支持 | `SetFollowRedirects(true)` | 新增 |
-| MQTT 发布 | `Publish(topic, payload, qos) -> bool` | `Publish(topic, payload, qos, retain) -> Result<int>` | 返回 msg_id，支持 retain |
+| MQTT 发布 | `Publish(topic, payload, qos) -> bool` | `Publish(topic, payload, qos, retain) -> Result<int>` | 返回 message_id，支持 retain |
 | MQTT 遗嘱 | 不支持 | `SetWill(will)` | 新增 |
-| MQTT QoS 确认 | 不支持 | `OnPublishAck(callback)` | 新增 |
+| MQTT QoS 确认 | 不支持 | `OnPublishComplete(callback)` | 新增（覆盖 PUBACK 与 PUBCOMP） |
 | WS 心跳 | 手动实现 | `SetHeartbeat(config)` | 内置 |
 | WS 自动重连 | 手动实现 | `SetAutoReconnect(config)` | 内置 |
 | 错误类型 | `NetworkError` | `NetworkError`（扩展） | 新增更多错误码 |

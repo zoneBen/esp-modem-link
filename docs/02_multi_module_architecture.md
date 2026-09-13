@@ -270,7 +270,7 @@ public:
                                std::string_view host, uint16_t port) = 0;
 
     // 回调
-    void OnMessage(MessageCallback callback);   // 携带源地址
+    void OnMessage(UdpMessageCallback callback);   // 携带源地址
     void OnError(ErrorCallback callback);
 
     bool IsConnected() const;
@@ -299,6 +299,12 @@ public:
     virtual void SetKeepAlive(bool enable) = 0;
     virtual void SetTlsConfig(const TlsConfig& config) = 0;  // 新增
 
+    // 重定向跟随，默认开启且限额很小。不是每个引擎都能兑现：把 HTTP 交给
+    // 模组固件的引擎只有那个固件的重定向行为，调用方在它上面设置这两项，
+    // 是在要求一件它做不到的事。所以这里给了默认实现（不生效）而不是纯虚。
+    virtual void SetFollowRedirects(bool enable) { (void)enable; }
+    virtual void SetMaxRedirects(int max) { (void)max; }
+
     // 执行请求
     virtual Result<HttpResponse> Execute(std::string_view method,
                                          std::string_view url) = 0;
@@ -314,6 +320,10 @@ public:
     virtual Result<int> GetStatusCode() = 0;
     virtual std::string GetResponseHeader(std::string_view key) const = 0;
     virtual size_t GetContentLength() const = 0;
+    // 响应体是否为分块框架。分块响应不带 Content-Length，所以上面那个在
+    // 这种情况下返回 0 而后面仍有响应体；Read() 两种框架都会解码，这个
+    // 方法是给想知道响应是怎么装的调用方看的。
+    virtual bool IsChunked() const = 0;
 };
 
 struct HttpResponse {
@@ -352,16 +362,16 @@ public:
     // 发布/订阅
     virtual Result<int> Publish(std::string_view topic,
                                 std::string_view payload,
-                                MqttQoS qos = MqttQoS::QoS0,
-                                bool retain = false) = 0;  // 返回 msg_id
+                                MqttQoS qos = MqttQoS::kQoS0,
+                                bool retain = false) = 0;  // 返回 message_id
     virtual Result<int> Subscribe(std::string_view topic,
-                                  MqttQoS qos = MqttQoS::QoS0) = 0;
+                                  MqttQoS qos = MqttQoS::kQoS0) = 0;
     virtual Result<> Unsubscribe(std::string_view topic) = 0;
 
     // 回调
     void OnConnected(EventCallback callback);
     void OnDisconnected(EventCallback callback);
-    void OnMessage(MessageCallback callback);
+    void OnMessage(MqttMessageCallback callback);   // 按值传递 MqttMessage
     void OnError(ErrorCallback callback);
     void OnPublishComplete(PublishAckCallback callback);  // 新增：QoS 确认
 
@@ -370,7 +380,7 @@ public:
 ```
 
 **改进**：
-- 完整 QoS 支持（返回 msg_id + OnPublishAck 回调）
+- 完整 QoS 支持（返回 message_id + OnPublishComplete 回调）
 - 遗嘱消息支持
 - 完整 TLS 配置
 - 所有方法返回 `Result<>`
@@ -385,15 +395,14 @@ public:
     // 配置
     virtual void SetHeader(std::string_view key,
                            std::string_view value) = 0;
-    virtual void SetHeartbeat(std::chrono::seconds interval,
-                              std::chrono::seconds timeout) = 0;  // 新增
-    virtual void SetAutoReconnect(bool enable,
-                                  int max_retries = -1) = 0;  // 新增
+    virtual void SetTlsConfig(const TlsConfig& config) = 0;  // 新增
+    virtual void SetHeartbeat(const HeartbeatConfig& config) = 0;      // 新增
+    virtual void SetAutoReconnect(const ReconnectConfig& config) = 0;  // 新增
 
     // 连接
     virtual Result<> Connect(std::string_view url) = 0;
     virtual void Close(WebSocketCloseCode code =
-                       WebSocketCloseCode::Normal,
+                       WebSocketCloseCode::kNormal,
                        std::string_view reason = "") = 0;
 
     // 发送
@@ -405,8 +414,8 @@ public:
 
     // 回调
     void OnConnected(EventCallback callback);
-    void OnDisconnected(CloseCallback callback);  // 携带关闭码
-    void OnMessage(DataCallback callback);
+    void OnDisconnected(WebSocketCloseCallback callback);  // 携带关闭码
+    void OnMessage(WebSocketMessageCallback callback);     // 携带 binary 标志
     void OnError(ErrorCallback callback);
     void OnPong(DataCallback callback);
 
@@ -415,8 +424,10 @@ public:
 ```
 
 **改进**：
-- 内置心跳机制（可配置间隔和超时）
-- 内置自动重连（可配置重试次数）
+- 内置心跳机制（`HeartbeatConfig`，可配置间隔和超时）
+- 内置自动重连（`ReconnectConfig`，可配置重试次数与退避）
+- 两者都整体替换配置，不用两个参数分别传入——否则"只改超时"会说不出口，
+  只能把间隔一起重复一遍，且加第三个字段就再改一次签名
 - `Close` 支持关闭码和原因
 - `OnDisconnected` 携带关闭信息
 
